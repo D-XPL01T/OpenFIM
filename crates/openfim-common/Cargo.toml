@@ -1,0 +1,23 @@
+[package]
+name = "openfim-common"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+sha2.workspace = true
+blake3.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+cfg-if.workspace = true
+hex.workspace = true
+glob.workspace = true
+rusqlite.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.169"
+
+[dev-dependencies]
+tempfile.workspace = true

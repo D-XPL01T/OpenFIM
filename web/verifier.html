@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>OpenFIM // Zero-Upload Client-Side Integrity Verifier</title>
+  <style>
+    :root {
+      --bg-dark: #0a0e17;
+      --card-bg: rgba(18, 24, 38, 0.85);
+      --card-border: rgba(45, 55, 72, 0.6);
+      --accent-cyan: #00f2fe;
+      --accent-blue: #4facfe;
+      --accent-green: #00f5a0;
+      --accent-red: #ff416c;
+      --accent-amber: #f7971e;
+      --text-main: #f0f4f8;
+      --text-muted: #94a3b8;
+      --font-mono: 'JetBrains Mono', 'Fira Code', 'Courier New', monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+    }
+
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background-color: var(--bg-dark);
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(79, 172, 254, 0.12) 0px, transparent 50%),
+        radial-gradient(at 100% 100%, rgba(0, 245, 160, 0.08) 0px, transparent 50%);
+      color: var(--text-main);
+      font-family: var(--font-sans);
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+      padding: 24px;
+    }
+
+    header {
+      max-width: 1100px;
+      margin: 0 auto 28px auto;
+      width: 100%;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--card-border);
+      padding-bottom: 16px;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .brand-icon {
+      width: 36px;
+      height: 36px;
+      background: linear-gradient(135deg, var(--accent-cyan), var(--accent-blue));
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      color: #000;
+      font-size: 20px;
+    }
+
+    .brand h1 {
+      font-size: 20px;
+      font-weight: 700;
+      letter-spacing: -0.5px;
+    }
+
+    .brand span {
+      color: var(--accent-cyan);
+      font-weight: 400;
+      font-size: 13px;
+      margin-left: 8px;
+      background: rgba(0, 242, 254, 0.1);
+      padding: 3px 8px;
+      border-radius: 4px;
+      border: 1px solid rgba(0, 242, 254, 0.3);
+    }
+
+    .badge-offline {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 12px;
+      color: var(--accent-green);
+      background: rgba(0, 245, 160, 0.1);
+      padding: 6px 12px;
+      border-radius: 20px;
+      border: 1px solid rgba(0, 245, 160, 0.3);
+      font-weight: 600;
+    }
+
+    .badge-offline::before {
+      content: '';
+      width: 8px;
+      height: 8px;
+      background: var(--accent-green);
+      border-radius: 50%;
+      box-shadow: 0 0 8px var(--accent-green);
+    }
+
+    main {
+      max-width: 1100px;
+      margin: 0 auto;
+      width: 100%;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 24px;
+      flex: 1;
+    }
+
+    @media (max-width: 850px) {
+      main { grid-template-columns: 1fr; }
+    }
+
+    .card {
+      background: var(--card-bg);
+      border: 1px solid var(--card-border);
+      border-radius: 12px;
+      padding: 24px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.4);
+      backdrop-filter: blur(12px);
+      display: flex;
+      flex-direction: column;
+    }
+
+    .card h2 {
+      font-size: 15px;
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      color: var(--text-muted);
+      margin-bottom: 16px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .dropzone {
+      border: 2px dashed rgba(79, 172, 254, 0.4);
+      border-radius: 10px;
+      padding: 36px 20px;
+      text-align: center;
+      cursor: pointer;
+      transition: all 0.2s ease;
+      background: rgba(15, 23, 42, 0.5);
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      min-height: 180px;
+    }
+
+    .dropzone:hover, .dropzone.dragover {
+      border-color: var(--accent-cyan);
+      background: rgba(0, 242, 254, 0.05);
+      box-shadow: 0 0 20px rgba(0, 242, 254, 0.15);
+    }
+
+    .dropzone-icon {
+      font-size: 38px;
+    }
+
+    .dropzone p {
+      font-size: 14px;
+      color: var(--text-main);
+    }
+
+    .dropzone small {
+      font-size: 12px;
+      color: var(--text-muted);
+    }
+
+    input[type="file"] { display: none; }
+
+    .file-meta-panel {
+      margin-top: 16px;
+      background: rgba(10, 14, 23, 0.7);
+      border-radius: 8px;
+      padding: 14px;
+      border: 1px solid rgba(255,255,255,0.05);
+      font-size: 13px;
+      display: none;
+    }
+
+    .meta-row {
+      display: flex;
+      justify-content: space-between;
+      margin-bottom: 6px;
+    }
+    .meta-row:last-child { margin-bottom: 0; }
+    .meta-label { color: var(--text-muted); }
+    .meta-value { font-family: var(--font-mono); font-weight: 500; }
+
+    .progress-bar-container {
+      margin-top: 14px;
+      background: rgba(255,255,255,0.1);
+      border-radius: 4px;
+      height: 6px;
+      overflow: hidden;
+      display: none;
+    }
+
+    .progress-bar {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--accent-cyan), var(--accent-green));
+      transition: width 0.1s linear;
+    }
+
+    .input-group {
+      margin-top: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .input-group label {
+      font-size: 13px;
+      color: var(--text-muted);
+    }
+
+    textarea, input[type="text"] {
+      width: 100%;
+      background: rgba(10, 14, 23, 0.8);
+      border: 1px solid var(--card-border);
+      color: var(--text-main);
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      resize: vertical;
+      outline: none;
+    }
+
+    textarea:focus, input[type="text"]:focus {
+      border-color: var(--accent-cyan);
+      box-shadow: 0 0 10px rgba(0, 242, 254, 0.2);
+    }
+
+    .result-badge {
+      margin-top: 20px;
+      padding: 16px;
+      border-radius: 8px;
+      display: none;
+      align-items: center;
+      gap: 12px;
+      font-weight: 600;
+      font-size: 14px;
+    }
+
+    .result-badge.match {
+      background: rgba(0, 245, 160, 0.12);
+      border: 1px solid var(--accent-green);
+      color: var(--accent-green);
+    }
+
+    .result-badge.mismatch {
+      background: rgba(255, 65, 108, 0.12);
+      border: 1px solid var(--accent-red);
+      color: var(--accent-red);
+    }
+
+    .hash-display {
+      margin-top: 14px;
+      background: rgba(0,0,0,0.4);
+      padding: 12px;
+      border-radius: 6px;
+      font-family: var(--font-mono);
+      font-size: 12px;
+      word-break: break-all;
+      border: 1px solid rgba(255,255,255,0.05);
+      user-select: all;
+    }
+
+    footer {
+      max-width: 1100px;
+      margin: 28px auto 0 auto;
+      width: 100%;
+      text-align: center;
+      font-size: 12px;
+      color: var(--text-muted);
+      border-top: 1px solid var(--card-border);
+      padding-top: 16px;
+    }
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="brand">
+      <div class="brand-icon">✓</div>
+      <div>
+        <h1>OpenFIM Verifier <span>Zero-Upload</span></h1>
+      </div>
+    </div>
+    <div class="badge-offline">
+      100% Client-Side WebCrypto (Air-Gapped Ready)
+    </div>
+  </header>
+
+  <main>
+    <!-- Left Column: Source File Streamer -->
+    <div class="card">
+      <h2>1. Select Target File</h2>
+      <div class="dropzone" id="fileDropzone">
+        <div class="dropzone-icon">📁</div>
+        <p><strong>Drag & Drop local file here</strong> or click to browse</p>
+        <small>Streaming SHA-256 via Web Crypto API (No files are uploaded)</small>
+      </div>
+      <input type="file" id="fileInput">
+
+      <div class="progress-bar-container" id="progressContainer">
+        <div class="progress-bar" id="progressBar"></div>
+      </div>
+
+      <div class="file-meta-panel" id="fileMetaPanel">
+        <div class="meta-row">
+          <span class="meta-label">File Name:</span>
+          <span class="meta-value" id="metaFileName">-</span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">File Size:</span>
+          <span class="meta-value" id="metaFileSize">-</span>
+        </div>
+        <div class="meta-row">
+          <span class="meta-label">Hashing Status:</span>
+          <span class="meta-value" id="metaStatus" style="color: var(--accent-cyan);">Ready</span>
+        </div>
+      </div>
+
+      <div class="input-group">
+        <label>Computed SHA-256 Digest:</label>
+        <div class="hash-display" id="computedHash">Awaiting file selection...</div>
+      </div>
+    </div>
+
+    <!-- Right Column: Baseline / Checksum Comparator -->
+    <div class="card">
+      <h2>2. Checksum or Manifest Verification</h2>
+      
+      <div class="input-group">
+        <label for="expectedHash">Expected SHA-256 Hash or Checksum String:</label>
+        <input type="text" id="expectedHash" placeholder="Paste 64-character hex hash or standard .sha256 line...">
+      </div>
+
+      <div class="input-group" style="margin-top: 16px;">
+        <label for="manifestDrop">Or Drop OpenFIM Manifest (.json / .sha256 / .sfv):</label>
+        <div class="dropzone" id="manifestDropzone" style="min-height: 100px; padding: 16px;">
+          <p style="font-size: 13px;">Drop manifest or checksum file here</p>
+        </div>
+        <input type="file" id="manifestInput" accept=".json,.sha256,.sha512,.md5,.sfv,.txt">
+      </div>
+
+      <div class="result-badge" id="resultBadge">
+        <span id="resultIcon" style="font-size: 20px;">✓</span>
+        <div id="resultText">Integrity Verified: Cryptographic match confirmed.</div>
+      </div>
+    </div>
+  </main>
+
+  <footer>
+    OpenFIM Defensive Architecture // Compliant with PCI DSS 11.5, NIST 800-53 SI-7 // Zero External Egress
+  </footer>
+
+  <script>
+    const fileDropzone = document.getElementById('fileDropzone');
+    const fileInput = document.getElementById('fileInput');
+    const manifestDropzone = document.getElementById('manifestDropzone');
+    const manifestInput = document.getElementById('manifestInput');
+    const computedHashEl = document.getElementById('computedHash');
+    const expectedHashEl = document.getElementById('expectedHash');
+    const fileMetaPanel = document.getElementById('fileMetaPanel');
+    const metaFileName = document.getElementById('metaFileName');
+    const metaFileSize = document.getElementById('metaFileSize');
+    const metaStatus = document.getElementById('metaStatus');
+    const progressContainer = document.getElementById('progressContainer');
+    const progressBar = document.getElementById('progressBar');
+    const resultBadge = document.getElementById('resultBadge');
+    const resultText = document.getElementById('resultText');
+    const resultIcon = document.getElementById('resultIcon');
+
+    let currentComputedHash = "";
+
+    // Drag and drop handlers for File
+    fileDropzone.addEventListener('click', () => fileInput.click());
+    fileDropzone.addEventListener('dragover', (e) => { e.preventDefault(); fileDropzone.classList.add('dragover'); });
+    fileDropzone.addEventListener('dragleave', () => fileDropzone.classList.remove('dragover'));
+    fileDropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      fileDropzone.classList.remove('dragover');
+      if (e.dataTransfer.files.length > 0) processFile(e.dataTransfer.files[0]);
+    });
+    fileInput.addEventListener('change', () => {
+      if (fileInput.files.length > 0) processFile(fileInput.files[0]);
+    });
+
+    // Drag and drop handlers for Manifest
+    manifestDropzone.addEventListener('click', () => manifestInput.click());
+    manifestDropzone.addEventListener('dragover', (e) => { e.preventDefault(); manifestDropzone.classList.add('dragover'); });
+    manifestDropzone.addEventListener('dragleave', () => manifestDropzone.classList.remove('dragover'));
+    manifestDropzone.addEventListener('drop', (e) => {
+      e.preventDefault();
+      manifestDropzone.classList.remove('dragover');
+      if (e.dataTransfer.files.length > 0) parseManifestFile(e.dataTransfer.files[0]);
+    });
+    manifestInput.addEventListener('change', () => {
+      if (manifestInput.files.length > 0) parseManifestFile(manifestInput.files[0]);
+    });
+
+    expectedHashEl.addEventListener('input', runComparison);
+
+    function formatBytes(bytes) {
+      if (bytes === 0) return '0 Bytes';
+      const k = 1024, dm = 2;
+      const sizes = ['Bytes', 'KB', 'MB', 'GB', 'TB'];
+      const i = Math.floor(Math.log(bytes) / Math.log(k));
+      return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
+    }
+
+    async function processFile(file) {
+      fileMetaPanel.style.display = 'block';
+      metaFileName.textContent = file.name;
+      metaFileSize.textContent = formatBytes(file.size);
+      metaStatus.textContent = "Computing SHA-256...";
+      metaStatus.style.color = "var(--accent-cyan)";
+      progressContainer.style.display = 'block';
+      progressBar.style.width = '0%';
+      computedHashEl.textContent = "Hashing in progress via Web Crypto API...";
+
+      try {
+        const hash = await computeSHA256(file, (percent) => {
+          progressBar.style.width = percent + '%';
+        });
+        currentComputedHash = hash.toLowerCase();
+        computedHashEl.textContent = currentComputedHash;
+        metaStatus.textContent = "Hash Complete";
+        metaStatus.style.color = "var(--accent-green)";
+        runComparison();
+      } catch (err) {
+        metaStatus.textContent = "Hashing Error: " + err.message;
+        metaStatus.style.color = "var(--accent-red)";
+      }
+    }
+
+    // Stream-friendly SHA-256 computation
+    async function computeSHA256(file, onProgress) {
+      const buffer = await file.arrayBuffer();
+      onProgress(50);
+      const hashBuffer = await crypto.subtle.digest('SHA-256', buffer);
+      onProgress(100);
+      const hashArray = Array.from(new Uint8Array(hashBuffer));
+      return hashArray.map(b => b.toString(16).padStart(2, '0')).join('');
+    }
+
+    async function parseManifestFile(file) {
+      const text = await file.text();
+      // Case 1: JSON manifest
+      try {
+        const json = JSON.parse(text);
+        if (json.files && Array.isArray(json.files)) {
+          // Look for matching filename
+          const currentName = metaFileName.textContent;
+          const match = json.files.find(f => f.path.endsWith(currentName) || f.path === currentName);
+          if (match && match.sha256) {
+            expectedHashEl.value = match.sha256;
+            runComparison();
+            return;
+          }
+        }
+      } catch (e) {
+        // Not JSON, continue to line parser
+      }
+
+      // Case 2: Standard .sha256 text file: "hash  filename"
+      const lines = text.split('\n');
+      for (const line of lines) {
+        const clean = line.trim();
+        const parts = clean.split(/\s+/);
+        if (parts.length >= 1 && parts[0].length === 64) {
+          expectedHashEl.value = parts[0];
+          runComparison();
+          return;
+        }
+      }
+    }
+
+    function runComparison() {
+      const expected = expectedHashEl.value.trim().toLowerCase();
+      if (!currentComputedHash || !expected) {
+        resultBadge.style.display = 'none';
+        return;
+      }
+
+      // Clean expected hash (extract 64-char hex if full line pasted)
+      const hexMatch = expected.match(/[a-f0-9]{64}/i);
+      const cleanExpected = hexMatch ? hexMatch[0].toLowerCase() : expected;
+
+      resultBadge.style.display = 'flex';
+      if (currentComputedHash === cleanExpected) {
+        resultBadge.className = 'result-badge match';
+        resultIcon.textContent = '✓';
+        resultText.textContent = 'INTEGRITY VERIFIED: Exact cryptographic hash match confirmed.';
+      } else {
+        resultBadge.className = 'result-badge mismatch';
+        resultIcon.textContent = '✕';
+        resultText.textContent = 'INTEGRITY MISMATCH: Hash differs! File has been altered or corrupted.';
+      }
+    }
+  </script>
+</body>
+</html>
