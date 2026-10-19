@@ -170,3 +170,125 @@ fn test_day4_sqlite_baseline_diff_pipeline() {
     assert_eq!(diff.removed.len(), 1);
     assert_eq!(diff.removed[0].path, file3_path);
 }
+
+#[test]
+fn test_day5_declarative_policy_and_signature_pipeline() {
+    use openfim_common::{
+        ActiveResponseAction, PolicySigner, PolicyVerifier, RuleMode,
+    };
+    use tempfile::tempdir;
+
+    let dir = tempdir().unwrap();
+    let policy_path = dir.path().join("production.yaml");
+    let sig_path = dir.path().join("production.yaml.sig");
+
+    let sample_yaml = r#"
+version: "1.0"
+policy_id: "pol-prod-sec-audit"
+name: "Audit Policy v1"
+author: "SOC Architecture"
+signature_algorithm: "ed25519"
+
+globals:
+  default_hash: "sha256"
+  max_io_rate_mb_s: 30
+  scan_nice_priority: 5
+  realtime_fallback_sweep_interval: 1800
+
+rules:
+  - id: "RULE_ETC_PASSWD"
+    description: "Monitors password file"
+    paths:
+      - "/etc/passwd"
+    recursive: false
+    mode: "realtime"
+    checks:
+      hash: true
+      size: true
+      permissions: true
+      ownership: true
+      timestamps: false
+      attributes: true
+      xattrs: true
+    nodiff: true
+    severity: 10
+    whodata: true
+    active_response:
+      action: "restore_baseline"
+
+  - id: "RULE_VAR_WWW"
+    description: "Monitors web root"
+    paths:
+      - "/var/www/html"
+    recursive: true
+    mode: "realtime"
+    checks:
+      hash: true
+      size: true
+      permissions: true
+      ownership: true
+      timestamps: false
+      attributes: false
+      xattrs: false
+    nodiff: false
+    ignore:
+      - "**/cache/**"
+      - "**/logs/**"
+    severity: 8
+    whodata: true
+    active_response:
+      action: "quarantine"
+"#;
+
+    // 1. Write policy file to disk
+    std::fs::write(&policy_path, sample_yaml).unwrap();
+
+    // 2. Generate administrative keypair and sign policy file
+    let (admin_signing_key, admin_verifying_key) = PolicySigner::generate_keypair();
+    let signature = PolicySigner::sign_file(&policy_path, &admin_signing_key).unwrap();
+    let sig_hex = PolicySigner::signature_to_hex(&signature);
+    std::fs::write(&sig_path, sig_hex.as_bytes()).unwrap();
+
+    // 3. Verify signed policy file with authorized admin public key
+    let verified_policy =
+        PolicyVerifier::verify_file(&policy_path, &sig_path, &admin_verifying_key).unwrap();
+
+    assert_eq!(verified_policy.policy_id, "pol-prod-sec-audit");
+    assert_eq!(verified_policy.globals.max_io_rate_mb_s, 30);
+    assert_eq!(verified_policy.rules.len(), 2);
+    assert_eq!(
+        verified_policy.rules[0].active_response.action,
+        ActiveResponseAction::RestoreBaseline
+    );
+    assert_eq!(verified_policy.rules[0].mode, RuleMode::Realtime);
+
+    // 4. Test tamper detection: modify policy file on disk and ensure verification fails
+    let tampered_yaml = format!("{}\n# Injected malicious comment\n", sample_yaml);
+    std::fs::write(&policy_path, tampered_yaml).unwrap();
+
+    let tamper_res = PolicyVerifier::verify_file(&policy_path, &sig_path, &admin_verifying_key);
+    assert!(
+        tamper_res.is_err(),
+        "Tampered policy must be rejected by PolicyVerifier"
+    );
+
+    // Restore valid content
+    std::fs::write(&policy_path, sample_yaml).unwrap();
+
+    // 5. Test key mismatch: verify against an untrusted public key
+    let (_untrusted_signing, untrusted_verifying) = PolicySigner::generate_keypair();
+    let untrusted_res =
+        PolicyVerifier::verify_file(&policy_path, &sig_path, &untrusted_verifying);
+    assert!(
+        untrusted_res.is_err(),
+        "Policy signed by Admin must be rejected when verified against untrusted key"
+    );
+
+    // 6. Test rule path matching and ignore mechanics
+    assert!(verified_policy.is_monitored(std::path::Path::new("/etc/passwd")));
+    assert!(verified_policy.is_monitored(std::path::Path::new("/var/www/html/index.php")));
+    assert!(!verified_policy.is_monitored(std::path::Path::new("/var/www/html/cache/session.dat")));
+    assert!(!verified_policy.is_monitored(std::path::Path::new("/var/www/html/logs/access.log")));
+    assert!(!verified_policy.is_monitored(std::path::Path::new("/tmp/unmonitored.txt")));
+}
+

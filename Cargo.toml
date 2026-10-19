@@ -23,6 +23,7 @@ clap = { version = "4.5.31", features = ["derive", "env"] }
 tokio = { version = "1.43.0", features = ["full"] }
 rusqlite = { version = "0.33.0", features = ["bundled"] }
 ed25519-dalek = { version = "2.1.1", features = ["rand_core"] }
+rand_core = { version = "0.6.4", features = ["std", "getrandom"] }
 cfg-if = "1.0.0"
 hex = "0.4.3"
 tempfile = "3.17.1"

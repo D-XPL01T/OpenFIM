@@ -29,8 +29,26 @@ pub enum OpenFimError {
     #[error("Serialization error: {0}")]
     SerializationError(#[from] serde_json::Error),
 
+    #[error("YAML Policy parse error: {0}")]
+    PolicyYamlError(#[from] serde_yaml::Error),
+
     #[error("Database error: {0}")]
     DatabaseError(#[from] rusqlite::Error),
+
+    #[error("Cryptographic signature verification failed: {0}")]
+    SignatureVerificationFailed(String),
+
+    #[error("Invalid cryptographic signature format: {0}")]
+    InvalidSignatureFormat(String),
+
+    #[error("Invalid cryptographic key format: {0}")]
+    InvalidKeyFormat(String),
+
+    #[error("Hex decoding error: {0}")]
+    HexDecodeError(#[from] hex::FromHexError),
+
+    #[error("General I/O error: {0}")]
+    StdIo(#[from] std::io::Error),
 
     #[error("General error: {0}")]
     Other(String),

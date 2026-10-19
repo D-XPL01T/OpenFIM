@@ -33,10 +33,11 @@ This actionable, day-by-day implementation plan guides the solo researcher throu
   - [x] Implement high-speed baseline diff query comparing disk stat tuples against SQLite index.
   - [x] Add CLI `baseline` subcommand (`init`, `snapshot`, `diff`, `status`) with integrity diff reports.
 
-- [ ] **Day 5: Declarative YAML Policy Parser & Ed25519 Verification**
-  - [ ] Define policy schema struct with serde deserializers for path rules, checks, and ignore globs.
-  - [ ] Implement Ed25519 public key signature verification on loaded policy files.
-  - [ ] Write integration test: load sample enterprise Linux policy, ensure invalid signatures are rejected.
+- [x] **Day 5: Declarative YAML Policy Parser & Ed25519 Verification**
+  - [x] Define policy schema struct with serde deserializers for path rules, checks, and ignore globs.
+  - [x] Implement Ed25519 public key signature verification on loaded policy files.
+  - [x] Write integration test: load sample enterprise Linux policy, ensure invalid signatures are rejected.
+  - [x] Add CLI `policy` subcommand suite (`check`, `keygen`, `sign`, `test-path`).
 
 ---
 

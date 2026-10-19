@@ -61,6 +61,12 @@ enum Commands {
         #[command(subcommand)]
         action: BaselineAction,
     },
+
+    /// Parse, sign, verify, and test declarative YAML policies
+    Policy {
+        #[command(subcommand)]
+        action: PolicyAction,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -111,6 +117,57 @@ pub enum BaselineAction {
         /// Path to SQLite database
         #[arg(long)]
         db: PathBuf,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum PolicyAction {
+    /// Validate YAML syntax and optionally verify Ed25519 signature
+    Check {
+        /// Target policy YAML file
+        #[arg(short, long)]
+        policy: PathBuf,
+
+        /// Optional admin Ed25519 public key in hex
+        #[arg(long)]
+        pubkey: Option<String>,
+
+        /// Optional detached signature file (.sig)
+        #[arg(long)]
+        sig: Option<PathBuf>,
+    },
+
+    /// Generate a fresh Ed25519 keypair for policy administration
+    Keygen {
+        /// Optional directory to save 'openfim_admin.pub' and 'openfim_admin.key'
+        #[arg(short, long)]
+        out_dir: Option<PathBuf>,
+    },
+
+    /// Cryptographically sign a policy YAML file with an Ed25519 private key
+    Sign {
+        /// Target policy YAML file
+        #[arg(short, long)]
+        policy: PathBuf,
+
+        /// Ed25519 private key seed (64-character hex or path to key file)
+        #[arg(short = 'k', long)]
+        privkey: String,
+
+        /// Output path for signature file (defaults to <policy>.sig)
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+
+    /// Test a specific file path against policy rules to inspect matching and severity
+    TestPath {
+        /// Target policy YAML file
+        #[arg(short, long)]
+        policy: PathBuf,
+
+        /// File path to test against policy rules
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
     },
 }
 
@@ -247,6 +304,130 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let count = baseline_db.count_entries()?;
                     println!("Database:       {}", db.display());
                     println!("Registered:     {} baseline files", count);
+                }
+            }
+        }
+
+        Commands::Policy { action } => {
+            use openfim_common::{Policy, PolicySigner, PolicyVerifier};
+
+            match action {
+                PolicyAction::Check { policy, pubkey, sig } => {
+                    println!("[*] Reading policy manifest: {}", policy.display());
+
+                    let loaded_policy = if let Some(pk_str) = pubkey {
+                        let verifying_key = PolicySigner::pubkey_from_hex(&pk_str)?;
+                        let pol = if let Some(s) = sig {
+                            PolicyVerifier::verify_file(&policy, &s, &verifying_key)?
+                        } else {
+                            PolicyVerifier::verify_file_auto(&policy, &verifying_key)?
+                        };
+                        println!("[✓] Ed25519 Cryptographic Signature: VALID & AUTHENTIC");
+                        pol
+                    } else {
+                        println!("[i] No public key provided. Skipping Ed25519 signature check.");
+                        Policy::from_yaml_file(&policy)?
+                    };
+
+                    println!("\n================ POLICY METADATA ================");
+                    println!("Policy ID:           {}", loaded_policy.policy_id);
+                    println!("Name:                {}", loaded_policy.name);
+                    println!("Author:              {}", loaded_policy.author);
+                    println!("Signature Algorithm: {}", loaded_policy.signature_algorithm);
+                    println!("Default Hashing:     {}", loaded_policy.globals.default_hash);
+                    println!("Max I/O Scan Rate:   {} MB/s", loaded_policy.globals.max_io_rate_mb_s);
+                    println!("Sweep Interval:      {} seconds", loaded_policy.globals.realtime_fallback_sweep_interval);
+                    println!("Total Rules Defined: {}", loaded_policy.rules.len());
+
+                    let roots = loaded_policy.get_monitored_roots();
+                    println!("\nMonitored Root Paths ({}):", roots.len());
+                    for r in &roots {
+                        println!("  - {}", r.display());
+                    }
+
+                    println!("\nRules Breakdown:");
+                    for rule in &loaded_policy.rules {
+                        println!(
+                            "  [{:2}] {} (mode: {:?}, nodiff: {}, action: {:?})",
+                            rule.severity, rule.id, rule.mode, rule.nodiff, rule.active_response.action
+                        );
+                    }
+                    println!("=================================================\n");
+                }
+
+                PolicyAction::Keygen { out_dir } => {
+                    let (signing_key, verifying_key) = PolicySigner::generate_keypair();
+                    let pub_hex = PolicySigner::pubkey_to_hex(&verifying_key);
+                    let priv_hex = PolicySigner::privkey_to_hex(&signing_key);
+
+                    println!("[+] Generated fresh Ed25519 administrative keypair:");
+                    println!("Public Key  (hex): {}", pub_hex);
+                    println!("Private Key (hex): {}", priv_hex);
+
+                    if let Some(dir) = out_dir {
+                        std::fs::create_dir_all(&dir)?;
+                        let pub_file = dir.join("openfim_admin.pub");
+                        let key_file = dir.join("openfim_admin.key");
+                        std::fs::write(&pub_file, pub_hex.as_bytes())?;
+                        std::fs::write(&key_file, priv_hex.as_bytes())?;
+                        println!("[+] Keys saved to:");
+                        println!("  - {}", pub_file.display());
+                        println!("  - {}", key_file.display());
+                    }
+                }
+
+                PolicyAction::Sign {
+                    policy,
+                    privkey,
+                    out,
+                } => {
+                    let key_str = if std::path::Path::new(&privkey).exists() {
+                        std::fs::read_to_string(&privkey)?
+                    } else {
+                        privkey
+                    };
+
+                    let signing_key = PolicySigner::privkey_from_hex(&key_str)?;
+                    let signature = PolicySigner::sign_file(&policy, &signing_key)?;
+                    let sig_hex = PolicySigner::signature_to_hex(&signature);
+
+                    let out_path = out.unwrap_or_else(|| {
+                        let mut p = policy.clone();
+                        let ext = p.extension().map_or("sig".to_string(), |e| format!("{}.sig", e.to_string_lossy()));
+                        p.set_extension(ext);
+                        p
+                    });
+
+                    std::fs::write(&out_path, sig_hex.as_bytes())?;
+                    println!("[+] Successfully signed policy file: {}", policy.display());
+                    println!("[+] Ed25519 Detached Signature written to: {}", out_path.display());
+                }
+
+                PolicyAction::TestPath { policy, path } => {
+                    let pol = Policy::from_yaml_file(&policy)?;
+                    println!("[*] Testing path '{}' against policy '{}'...", path.display(), pol.policy_id);
+
+                    if let Some(rule) = pol.find_matching_rule(&path) {
+                        println!("\n[✓] PATH MONITORED: Integrity rule matched!");
+                        println!("  Rule ID:         {}", rule.id);
+                        println!("  Description:     {}", rule.description);
+                        println!("  Severity:        {}/10", rule.severity);
+                        println!("  Mode:            {:?}", rule.mode);
+                        println!("  NoDiff (Secret): {}", rule.nodiff);
+                        println!("  WhoData:         {}", rule.whodata);
+                        println!("  Active Response: {:?}", rule.active_response.action);
+                        println!(
+                            "  Checks:          hash={}, size={}, perms={}, owner={}, timestamps={}, xattrs={}",
+                            rule.checks.hash,
+                            rule.checks.size,
+                            rule.checks.permissions,
+                            rule.checks.ownership,
+                            rule.checks.timestamps,
+                            rule.checks.xattrs
+                        );
+                    } else {
+                        println!("\n[x] PATH NOT MONITORED: Path is ignored or not targeted by any rule.");
+                    }
                 }
             }
         }
