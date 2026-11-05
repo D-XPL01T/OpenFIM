@@ -27,3 +27,25 @@ This repository contains the complete, production-grade defensive reference arch
 
 ## Standalone Artifacts
 - **Client-Side Verifier Tool**: [`web/verifier.html`](file:///d:/VibeCode/file_integrity/web/verifier.html) (Zero-upload, offline streaming checksum & manifest verifier running 100% in the browser).
+
+---
+
+## Interactive Metasploit-Style Console
+
+To launch the interactive defensive console, run `openfim-cli` with no arguments:
+
+```bash
+cargo run --bin openfim-cli
+# or execute:
+./target/debug/openfim-cli.exe
+```
+
+The console opens with a Metasploit-style cyber defense banner, status statistics, and a numbered menu:
+- `[1] Quick File Check` — On-demand file inspection, baseline diff, and WhoData forensic event logs.
+- `[2] Setup Protection` — Guided wizard: keypair generation, declarative policy creation, digital signing, and baseline database snapshots.
+- `[3] Monitor & Remediate` — Real-time sensor daemon with automated active response rollback and quarantine.
+- `[4] Forensics & Audit Log` — Cryptographic HMAC chain verification and recent intrusion history.
+- `[5] Exit Console` — Clean termination.
+
+*Security Retry Rule*: Entering an invalid option displays an alert in red text and allows up to 3 tries before initiating security lockout and terminating.
+

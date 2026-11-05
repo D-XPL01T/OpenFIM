@@ -18,6 +18,8 @@ rusqlite.workspace = true
 serde_yaml.workspace = true
 ed25519-dalek.workspace = true
 rand_core.workspace = true
+notify = "6.1"
+hmac = "0.12"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.169"

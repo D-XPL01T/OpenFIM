@@ -1,10 +1,14 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use sha2::Sha256;
 
 use crate::error::Result;
 use crate::metadata::FileMetadata;
+
+type HmacSha256 = Hmac<Sha256>;
 
 /// Change record representing a cryptographic hash divergence
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +81,45 @@ pub struct SpoolEvent {
     pub sent_to_manager: bool,
 }
 
+/// Audit verification report for the tamper-evident offline spool
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpoolAuditReport {
+    pub total_events: usize,
+    pub is_valid: bool,
+    pub tampered_sequence_id: Option<i64>,
+    pub error_message: Option<String>,
+}
+
+/// Computes an HMAC-SHA256 signature chaining from the previous event's signature
+pub fn compute_event_hmac(
+    key: &[u8],
+    prev_hmac: &str,
+    event_id: &str,
+    ts: i64,
+    path: &str,
+    event_type: &str,
+    new_hash: Option<&str>,
+) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC supports arbitrary key length");
+    mac.update(prev_hmac.as_bytes());
+    mac.update(event_id.as_bytes());
+    mac.update(&ts.to_le_bytes());
+    mac.update(path.as_bytes());
+    mac.update(event_type.as_bytes());
+    if let Some(h) = new_hash {
+        mac.update(h.as_bytes());
+    }
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Canonicalizes/normalizes a path string for consistent database keying across OS path separators
+pub fn normalize_path_str<P: AsRef<Path>>(p: P) -> String {
+    let s = p.as_ref().to_string_lossy().replace('\\', "/");
+    let trimmed = s.strip_prefix("//?/").unwrap_or(&s);
+    let clean = trimmed.trim_start_matches("./");
+    clean.trim_end_matches('/').to_string()
+}
+
 /// Local SQLite Database for baseline management and offline spooling
 pub struct BaselineDb {
     conn: Connection,
@@ -89,6 +132,11 @@ impl BaselineDb {
         let db = Self { conn };
         db.init_schema()?;
         Ok(db)
+    }
+
+    /// Access underlying SQLite connection (e.g. for testing and introspection)
+    pub fn connection(&self) -> &Connection {
+        &self.conn
     }
 
     /// Creates an in-memory SQLite baseline database (primarily for testing and fast diffing)
@@ -170,7 +218,7 @@ impl BaselineDb {
             .unwrap_or_default()
             .as_secs() as i64;
 
-        let path_str = entry.path.to_string_lossy().to_string();
+        let path_str = normalize_path_str(&entry.path);
 
         self.conn.execute(
             r#"
@@ -227,7 +275,7 @@ impl BaselineDb {
             )?;
 
             for entry in entries {
-                let path_str = entry.path.to_string_lossy().to_string();
+                let path_str = normalize_path_str(&entry.path);
                 stmt.execute(params![
                     path_str,
                     entry.sha256,
@@ -256,18 +304,38 @@ impl BaselineDb {
         Ok(entries.len())
     }
 
-    /// Retrieves an entry by path from baseline
+    /// Retrieves an entry by path from baseline with cross-platform separator normalization
     pub fn get_entry<P: AsRef<Path>>(&self, path: P) -> Result<Option<FileMetadata>> {
-        let path_str = path.as_ref().to_string_lossy().to_string();
+        let path_ref = path.as_ref();
+        let norm_str = normalize_path_str(path_ref);
+        let abs_str = if let Ok(cur) = std::env::current_dir() {
+            if path_ref.is_relative() {
+                normalize_path_str(cur.join(path_ref))
+            } else {
+                norm_str.clone()
+            }
+        } else {
+            norm_str.clone()
+        };
+        let rel_str = if let Ok(cur) = std::env::current_dir() {
+            if let Ok(rel) = path_ref.strip_prefix(&cur) {
+                normalize_path_str(rel)
+            } else {
+                norm_str.clone()
+            }
+        } else {
+            norm_str.clone()
+        };
+
         let mut stmt = self.conn.prepare(
             r#"
             SELECT path, sha256, blake3, file_size, mode, uid, gid, inode, dev, nlink,
                    mtime, mtime_nsec, ctime, xattrs_hash, acl_hash, symlink_target, is_symlink, is_dir
-            FROM baseline_entries WHERE path = ?1
+            FROM baseline_entries WHERE path = ?1 OR path = ?2 OR path = ?3
             "#,
         )?;
 
-        let mut rows = stmt.query(params![path_str])?;
+        let mut rows = stmt.query(params![norm_str, abs_str, rel_str])?;
         if let Some(row) = rows.next()? {
             let p_str: String = row.get(0)?;
             Ok(Some(FileMetadata {
@@ -348,19 +416,29 @@ impl BaselineDb {
 
     /// Diffs the current filesystem snapshot against the active baseline
     pub fn diff_filesystem(&self, current_snapshot: &[FileMetadata]) -> Result<BaselineDiff> {
+        self.diff_filesystem_scoped(current_snapshot, None::<&Path>)
+    }
+
+    /// Diffs the current filesystem snapshot against the baseline, optionally scoping removed-file detection to a root prefix
+    pub fn diff_filesystem_scoped<P: AsRef<Path>>(
+        &self,
+        current_snapshot: &[FileMetadata],
+        scope: Option<P>,
+    ) -> Result<BaselineDiff> {
         let baseline_entries = self.get_all_entries()?;
-        let mut baseline_map: HashMap<PathBuf, FileMetadata> = HashMap::new();
+        let mut baseline_map: HashMap<String, FileMetadata> = HashMap::new();
         for b in baseline_entries {
-            baseline_map.insert(b.path.clone(), b);
+            baseline_map.insert(normalize_path_str(&b.path), b);
         }
 
         let mut diff = BaselineDiff::default();
         let mut observed_paths = HashMap::new();
 
         for current in current_snapshot {
-            observed_paths.insert(current.path.clone(), ());
+            let norm_current = normalize_path_str(&current.path);
+            observed_paths.insert(norm_current.clone(), ());
 
-            match baseline_map.get(&current.path) {
+            match baseline_map.get(&norm_current) {
                 None => {
                     // Path exists on disk but not in baseline -> Added
                     diff.added.push(current.clone());
@@ -394,9 +472,16 @@ impl BaselineDb {
             }
         }
 
+        let scope_norm = scope.as_ref().map(|s| normalize_path_str(s));
+
         // Check for removed files (in baseline, but not observed in current scan)
-        for (base_path, base_meta) in baseline_map {
-            if !observed_paths.contains_key(&base_path) {
+        for (base_key, base_meta) in baseline_map {
+            if let Some(ref sc) = scope_norm {
+                if !base_key.starts_with(sc) && !base_key.starts_with(&format!("{}/", sc)) {
+                    continue;
+                }
+            }
+            if !observed_paths.contains_key(&base_key) {
                 diff.removed.push(base_meta);
             }
         }
@@ -497,6 +582,191 @@ impl BaselineDb {
         }
 
         Ok(count)
+    }
+
+    /// Retrieves the most recent HMAC signature from the event spool (or 64 zeros for genesis)
+    pub fn get_last_spool_hmac(&self) -> Result<String> {
+        let mut stmt = self.conn.prepare(
+            "SELECT hmac_signature FROM event_spool ORDER BY sequence_id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(row.get(0)?)
+        } else {
+            Ok("0".repeat(64))
+        }
+    }
+
+    /// Cryptographically signs and appends an event to the local append-only HMAC chain
+    pub fn append_spool_event_chained(&self, event: &mut SpoolEvent, hmac_key: &[u8]) -> Result<i64> {
+        let prev_hmac = self.get_last_spool_hmac()?;
+        event.hmac_signature = compute_event_hmac(
+            hmac_key,
+            &prev_hmac,
+            &event.event_id,
+            event.timestamp_nano,
+            &event.path,
+            &event.event_type,
+            event.new_sha256.as_deref(),
+        );
+        self.append_spool_event(event)
+    }
+
+    /// Verifies the entire offline event spool HMAC chain and sequence continuity
+    pub fn verify_spool_chain(&self, hmac_key: &[u8]) -> Result<SpoolAuditReport> {
+        let mut stmt = self.conn.prepare(
+            "SELECT sequence_id, event_id, timestamp_nano, event_type, path, new_sha256, hmac_signature 
+             FROM event_spool ORDER BY sequence_id ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, Option<String>>(5)?,
+                row.get::<_, String>(6)?,
+            ))
+        })?;
+
+        let mut prev_hmac = "0".repeat(64);
+        let mut expected_seq = 1i64;
+        let mut count = 0;
+
+        for r in rows {
+            let (seq, event_id, ts, ev_type, path, new_hash, recorded_hmac) = r?;
+            if seq != expected_seq {
+                return Ok(SpoolAuditReport {
+                    total_events: count,
+                    is_valid: false,
+                    tampered_sequence_id: Some(seq),
+                    error_message: Some(format!(
+                        "Sequence gap detected: expected {}, found {}",
+                        expected_seq, seq
+                    )),
+                });
+            }
+            let expected_hmac = compute_event_hmac(
+                hmac_key,
+                &prev_hmac,
+                &event_id,
+                ts,
+                &path,
+                &ev_type,
+                new_hash.as_deref(),
+            );
+            if expected_hmac != recorded_hmac {
+                return Ok(SpoolAuditReport {
+                    total_events: count,
+                    is_valid: false,
+                    tampered_sequence_id: Some(seq),
+                    error_message: Some(format!(
+                        "Cryptographic HMAC mismatch at sequence {}",
+                        seq
+                    )),
+                });
+            }
+            prev_hmac = recorded_hmac;
+            expected_seq += 1;
+            count += 1;
+        }
+
+        Ok(SpoolAuditReport {
+            total_events: count,
+            is_valid: true,
+            tampered_sequence_id: None,
+            error_message: None,
+        })
+    }
+
+    /// Retrieves spool events for a specific path (most recent first)
+    pub fn get_events_for_path<P: AsRef<Path>>(&self, path: P, limit: usize) -> Result<Vec<SpoolEvent>> {
+        let path_ref = path.as_ref();
+        let norm_str = normalize_path_str(path_ref);
+        let abs_str = if let Ok(cur) = std::env::current_dir() {
+            if path_ref.is_relative() {
+                normalize_path_str(cur.join(path_ref))
+            } else {
+                norm_str.clone()
+            }
+        } else {
+            norm_str.clone()
+        };
+        let rel_str = if let Ok(cur) = std::env::current_dir() {
+            if let Ok(rel) = path_ref.strip_prefix(&cur) {
+                normalize_path_str(rel)
+            } else {
+                norm_str.clone()
+            }
+        } else {
+            norm_str.clone()
+        };
+
+        let mut stmt = self.conn.prepare(
+            r#"
+            SELECT sequence_id, event_id, timestamp_nano, event_type, path, severity,
+                   whodata_pid, whodata_uid, whodata_comm, whodata_exe, whodata_cmdline,
+                   whodata_cgroup, old_sha256, new_sha256, diff_snippet, hmac_signature, sent_to_manager
+            FROM event_spool
+            WHERE path = ?1 OR path = ?2 OR path = ?3
+            ORDER BY sequence_id DESC
+            LIMIT ?4
+            "#,
+        )?;
+
+        let rows = stmt.query_map(params![norm_str, abs_str, rel_str, limit as i64], |row| {
+            Ok(SpoolEvent {
+                sequence_id: Some(row.get(0)?),
+                event_id: row.get(1)?,
+                timestamp_nano: row.get(2)?,
+                event_type: row.get(3)?,
+                path: row.get(4)?,
+                severity: row.get(5)?,
+                whodata_pid: row.get(6)?,
+                whodata_uid: row.get(7)?,
+                whodata_comm: row.get(8)?,
+                whodata_exe: row.get(9)?,
+                whodata_cmdline: row.get(10)?,
+                whodata_cgroup: row.get(11)?,
+                old_sha256: row.get(12)?,
+                new_sha256: row.get(13)?,
+                diff_snippet: row.get(14)?,
+                hmac_signature: row.get(15)?,
+                sent_to_manager: row.get::<_, i32>(16)? == 1,
+            })
+        })?;
+
+        let mut events = Vec::new();
+        for r in rows {
+            events.push(r?);
+        }
+        Ok(events)
+    }
+
+    /// Exports the baseline database as a portable JSON or .sha256 manifest
+    pub fn export_manifest(&self, format: &str) -> Result<String> {
+        let entries = self.get_all_entries()?;
+        if format.eq_ignore_ascii_case("sha256") {
+            let mut out = String::new();
+            for e in entries {
+                out.push_str(&format!("{}  {}\n", e.sha256, e.path.display()));
+            }
+            Ok(out)
+        } else {
+            #[derive(Serialize)]
+            struct ManifestOutput {
+                version: String,
+                total_files: usize,
+                files: Vec<FileMetadata>,
+            }
+            let manifest = ManifestOutput {
+                version: "1.0".to_string(),
+                total_files: entries.len(),
+                files: entries,
+            };
+            Ok(serde_json::to_string_pretty(&manifest)?)
+        }
     }
 }
 
@@ -619,5 +889,115 @@ mod tests {
 
         let unsent_after = db.get_unsent_spool_events(10).unwrap();
         assert_eq!(unsent_after.len(), 0);
+    }
+
+    #[test]
+    fn test_hmac_spool_chain_and_tamper_detection() {
+        let db = BaselineDb::open_in_memory().unwrap();
+        let key = b"super-secret-hmac-key";
+
+        let mut ev1 = SpoolEvent {
+            sequence_id: None,
+            event_id: "evt-001".to_string(),
+            timestamp_nano: 1700000000001,
+            event_type: "FILE_CREATED".to_string(),
+            path: "/etc/passwd".to_string(),
+            severity: 8,
+            whodata_pid: Some(100),
+            whodata_uid: Some(0),
+            whodata_comm: Some("useradd".to_string()),
+            whodata_exe: Some("/usr/sbin/useradd".to_string()),
+            whodata_cmdline: Some("useradd alice".to_string()),
+            whodata_cgroup: None,
+            old_sha256: None,
+            new_sha256: Some("sha_passwd_v1".to_string()),
+            diff_snippet: None,
+            hmac_signature: String::new(),
+            sent_to_manager: false,
+        };
+
+        let mut ev2 = SpoolEvent {
+            sequence_id: None,
+            event_id: "evt-002".to_string(),
+            timestamp_nano: 1700000000002,
+            event_type: "CONTENT_MUTATED".to_string(),
+            path: "/etc/sudoers".to_string(),
+            severity: 10,
+            whodata_pid: Some(101),
+            whodata_uid: Some(0),
+            whodata_comm: Some("visudo".to_string()),
+            whodata_exe: Some("/usr/sbin/visudo".to_string()),
+            whodata_cmdline: Some("visudo".to_string()),
+            whodata_cgroup: None,
+            old_sha256: Some("sha_sudo_v1".to_string()),
+            new_sha256: Some("sha_sudo_v2".to_string()),
+            diff_snippet: None,
+            hmac_signature: String::new(),
+            sent_to_manager: false,
+        };
+
+        let seq1 = db.append_spool_event_chained(&mut ev1, key).unwrap();
+        let seq2 = db.append_spool_event_chained(&mut ev2, key).unwrap();
+        assert_eq!(seq1, 1);
+        assert_eq!(seq2, 2);
+
+        // Verify valid chain
+        let audit = db.verify_spool_chain(key).unwrap();
+        assert!(audit.is_valid);
+        assert_eq!(audit.total_events, 2);
+        assert!(audit.tampered_sequence_id.is_none());
+
+        // Simulate adversary tampering with record 2 in the database
+        db.conn
+            .execute(
+                "UPDATE event_spool SET path = '/etc/sudoers_fake' WHERE sequence_id = 2",
+                [],
+            )
+            .unwrap();
+
+        // Audit must now catch the tamper!
+        let audit_tampered = db.verify_spool_chain(key).unwrap();
+        assert!(!audit_tampered.is_valid);
+        assert_eq!(audit_tampered.tampered_sequence_id, Some(2));
+    }
+
+    #[test]
+    fn test_get_events_for_path_and_export_manifest() {
+        let mut db = BaselineDb::open_in_memory().unwrap();
+        let f1 = dummy_file("/app/config.json", "hash123", 1024, 0o644);
+        db.insert_batch(&[f1], "v1").unwrap();
+
+        let json_manifest = db.export_manifest("json").unwrap();
+        assert!(json_manifest.contains("hash123"));
+        assert!(json_manifest.contains("config.json"));
+
+        let sha_manifest = db.export_manifest("sha256").unwrap();
+        assert!(sha_manifest.contains("hash123"));
+
+        let ev = SpoolEvent {
+            sequence_id: None,
+            event_id: "evt-999".to_string(),
+            timestamp_nano: 1700000000005,
+            event_type: "CONTENT_MUTATED".to_string(),
+            path: "/app/config.json".to_string(),
+            severity: 9,
+            whodata_pid: Some(555),
+            whodata_uid: Some(1000),
+            whodata_comm: Some("vim".to_string()),
+            whodata_exe: Some("/usr/bin/vim".to_string()),
+            whodata_cmdline: Some("vim /app/config.json".to_string()),
+            whodata_cgroup: None,
+            old_sha256: Some("hash123".to_string()),
+            new_sha256: Some("hash456".to_string()),
+            diff_snippet: None,
+            hmac_signature: "sig".to_string(),
+            sent_to_manager: false,
+        };
+        db.append_spool_event(&ev).unwrap();
+
+        let events = db.get_events_for_path("/app/config.json", 5).unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "CONTENT_MUTATED");
+        assert_eq!(events[0].whodata_comm.as_deref(), Some("vim"));
     }
 }

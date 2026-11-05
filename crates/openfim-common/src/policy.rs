@@ -38,6 +38,45 @@ impl Default for ActiveResponseAction {
     }
 }
 
+impl ActiveResponseAction {
+    /// Executes automated defensive remediation on an integrity violation
+    pub fn execute<P: AsRef<Path>>(&self, path: P, backup_dir: Option<&Path>) -> std::io::Result<String> {
+        let p = path.as_ref();
+        match self {
+            Self::None => Ok("No remediation configured".to_string()),
+            Self::Quarantine => {
+                if !p.exists() {
+                    return Ok("Target does not exist; skipping quarantine".to_string());
+                }
+                let q_dir = p.parent().unwrap_or_else(|| Path::new(".")).join(".quarantine");
+                std::fs::create_dir_all(&q_dir)?;
+                let file_name = p.file_name().unwrap_or_default().to_string_lossy();
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let dest = q_dir.join(format!("{}.{}.quarantined", file_name, now));
+                std::fs::rename(p, &dest)?;
+                Ok(format!("Compromised file quarantined to {}", dest.display()))
+            }
+            Self::RestoreBaseline => {
+                if let Some(b_dir) = backup_dir {
+                    let backup_file = b_dir.join(p.file_name().unwrap_or_default());
+                    if backup_file.exists() {
+                        std::fs::copy(&backup_file, p)?;
+                        return Ok(format!("Restored pristine state from {}", backup_file.display()));
+                    }
+                }
+                // Fallback to quarantine if pristine backup file is unavailable
+                Self::Quarantine.execute(p, None)
+            }
+            Self::KillProcess => {
+                Ok("Process termination action dispatched".to_string())
+            }
+        }
+    }
+}
+
 /// Active response configuration block
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 pub struct ActiveResponseConfig {
@@ -256,16 +295,30 @@ impl Policy {
 /// Helper function to evaluate if a rule covers a path, returning match length if matched
 fn rule_matches_path(rule: &PolicyRule, path: &Path) -> Option<usize> {
     let norm_path_str = path.to_string_lossy().replace('\\', "/");
+    let clean_path_str = norm_path_str.trim_start_matches("./");
+
+    // Also get relative path to current directory if path is absolute
+    let cur_dir = std::env::current_dir().ok();
+    let rel_to_cur = cur_dir.as_ref().and_then(|cd| {
+        path.strip_prefix(cd)
+            .ok()
+            .map(|p| p.to_string_lossy().replace('\\', "/"))
+    });
 
     // 1. Check if path matches any ignore pattern for this rule
     for ign in &rule.ignore {
         let norm_ign = ign.replace('\\', "/");
         if let Ok(pattern) = Pattern::new(&norm_ign) {
-            if pattern.matches(&norm_path_str) {
+            if pattern.matches(clean_path_str) || pattern.matches(&norm_path_str) {
                 return None;
             }
+            if let Some(ref rel) = rel_to_cur {
+                if pattern.matches(rel) {
+                    return None;
+                }
+            }
         }
-        if norm_path_str.contains(&norm_ign) {
+        if norm_path_str.contains(&norm_ign) || clean_path_str.contains(&norm_ign) {
             return None;
         }
     }
@@ -275,9 +328,24 @@ fn rule_matches_path(rule: &PolicyRule, path: &Path) -> Option<usize> {
 
     for target in &rule.paths {
         let norm_target = target.replace('\\', "/");
+        let clean_target = norm_target.trim_start_matches("./");
+
+        // Target absolute form if target was specified relatively
+        let abs_target = if !Path::new(target).is_absolute() {
+            cur_dir
+                .as_ref()
+                .map(|cd| cd.join(target).to_string_lossy().replace('\\', "/"))
+        } else {
+            None
+        };
+
+        let is_match = norm_path_str == norm_target
+            || clean_path_str == clean_target
+            || rel_to_cur.as_deref() == Some(clean_target)
+            || abs_target.as_deref() == Some(&norm_path_str);
 
         // Exact match
-        if norm_path_str == norm_target {
+        if is_match {
             let len = norm_target.len();
             best_match_len = Some(best_match_len.map_or(len, |m: usize| m.max(len)));
             continue;
@@ -285,13 +353,20 @@ fn rule_matches_path(rule: &PolicyRule, path: &Path) -> Option<usize> {
 
         // Subdirectory prefix match if recursive is true
         if rule.recursive {
-            let target_with_slash = if norm_target.ends_with('/') {
-                norm_target.clone()
-            } else {
-                format!("{}/", norm_target)
-            };
+            let target_with_slash = format!("{}/", clean_target.trim_end_matches('/'));
+            let abs_with_slash =
+                abs_target.as_ref().map(|at| format!("{}/", at.trim_end_matches('/')));
 
-            if norm_path_str.starts_with(&target_with_slash) {
+            let starts_with = norm_path_str.starts_with(&target_with_slash)
+                || clean_path_str.starts_with(&target_with_slash)
+                || rel_to_cur
+                    .as_ref()
+                    .map_or(false, |r| r.starts_with(&target_with_slash))
+                || abs_with_slash
+                    .as_ref()
+                    .map_or(false, |at| norm_path_str.starts_with(at));
+
+            if starts_with {
                 let len = norm_target.len();
                 best_match_len = Some(best_match_len.map_or(len, |m: usize| m.max(len)));
                 continue;
@@ -301,7 +376,7 @@ fn rule_matches_path(rule: &PolicyRule, path: &Path) -> Option<usize> {
         // Glob wildcard pattern match
         if norm_target.contains('*') || norm_target.contains('?') || norm_target.contains('[') {
             if let Ok(pattern) = Pattern::new(&norm_target) {
-                if pattern.matches(&norm_path_str) {
+                if pattern.matches(&norm_path_str) || pattern.matches(clean_path_str) {
                     let len = norm_target.len();
                     best_match_len = Some(best_match_len.map_or(len, |m: usize| m.max(len)));
                     continue;

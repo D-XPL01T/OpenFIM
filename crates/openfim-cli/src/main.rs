@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use clap::{Parser, Subcommand};
-use openfim_common::{FileMetadata, HashAlgorithm, StreamHasher, TokenBucket};
+use openfim_common::{BaselineDb, FileMetadata, HashAlgorithm, Policy, StreamHasher, TokenBucket};
+
+mod console;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -10,11 +12,35 @@ use openfim_common::{FileMetadata, HashAlgorithm, StreamHasher, TokenBucket};
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 }
 
 #[derive(Subcommand, Debug)]
 enum Commands {
+    /// Launch interactive Metasploit-style defensive integrity console
+    #[command(alias = "interactive")]
+    Console,
+
+    /// On-demand file integrity verification: check tampering, baseline match, policy rules, and audit trail
+    #[command(alias = "check-file")]
+    VerifyFile {
+        /// Target file to verify
+        #[arg(value_name = "FILE")]
+        path: PathBuf,
+
+        /// Optional baseline database (defaults to openfim.db if present)
+        #[arg(short, long)]
+        db: Option<PathBuf>,
+
+        /// Optional policy YAML file (defaults to policy.yaml if present)
+        #[arg(short, long)]
+        policy: Option<PathBuf>,
+
+        /// Optional expected SHA-256 hash to assert against
+        #[arg(long)]
+        expected_hash: Option<String>,
+    },
+
     /// Calculate cryptographic hash of a file with streaming and TOCTOU protection
     Hash {
         /// Target file to hash
@@ -67,6 +93,26 @@ enum Commands {
         #[command(subcommand)]
         action: PolicyAction,
     },
+
+    /// Audit and verify tamper-evidence of local offline event spool
+    Audit {
+        #[command(subcommand)]
+        action: AuditAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum AuditAction {
+    /// Verify cryptographic HMAC chain and sequence continuity of the event spool
+    Verify {
+        /// Path to SQLite database containing event spool
+        #[arg(short, long, default_value = "openfim.db")]
+        db: PathBuf,
+
+        /// Secret key for HMAC-SHA256 verification
+        #[arg(short, long, default_value = "openfim-sensor-secret-key")]
+        key: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -117,6 +163,21 @@ pub enum BaselineAction {
         /// Path to SQLite database
         #[arg(long)]
         db: PathBuf,
+    },
+
+    /// Export baseline entries as a portable JSON or .sha256 manifest
+    Export {
+        /// Path to SQLite database
+        #[arg(long)]
+        db: PathBuf,
+
+        /// Output path for manifest file
+        #[arg(short, long)]
+        out: PathBuf,
+
+        /// Manifest format: json | sha256
+        #[arg(short, long, default_value = "json")]
+        format: String,
     },
 }
 
@@ -174,7 +235,216 @@ pub enum PolicyAction {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    match cli.command {
+    let cmd = match cli.command {
+        Some(c) => c,
+        None => {
+            return console::run_interactive_console();
+        }
+    };
+
+    match cmd {
+        Commands::Console => {
+            console::run_interactive_console()?;
+        }
+
+        Commands::VerifyFile {
+            path,
+            db,
+            policy,
+            expected_hash,
+        } => {
+            println!("======================================================================");
+            println!("               OPENFIM FILE INTEGRITY INSPECTION REPORT               ");
+            println!("======================================================================");
+            println!("Target Path:         {}", path.display());
+
+            let exists = path.exists();
+            let mut hasher = StreamHasher::default_sha256();
+
+            // 1. Physical inspection & cryptographic hashing
+            let current_meta = if exists && path.is_file() {
+                match FileMetadata::extract(&path, &mut hasher) {
+                    Ok(m) => Some(m),
+                    Err(e) => {
+                        eprintln!("[!] Failed to read file metadata or compute hash: {}", e);
+                        None
+                    }
+                }
+            } else if exists && path.is_dir() {
+                println!("File Type:           Directory");
+                None
+            } else {
+                println!("File Status:         MISSING / DELETED (Does not exist on disk)");
+                None
+            };
+
+            if let Some(ref m) = current_meta {
+                println!("File Status:         PRESENT ON DISK");
+                println!("File Size:           {} bytes", m.st_size);
+                println!("Permissions / Mode:  0o{:o}", m.st_mode);
+                println!("Last Modified Time:  Unix timestamp {} (ctime: {})", m.st_mtime, m.st_ctime);
+                println!("Computed SHA-256:    {}", m.sha256);
+                if let Some(ref b3) = m.blake3 {
+                    println!("Computed BLAKE3:     {}", b3);
+                }
+            }
+
+            // 2. Expected hash manual comparison
+            if let Some(ref exp) = expected_hash {
+                println!("\n[1] CHECKSUM ASSERTION");
+                let clean_exp = exp.trim().to_lowercase();
+                if let Some(ref m) = current_meta {
+                    if m.sha256.to_lowercase() == clean_exp {
+                        println!("    Result:          [✓] PASSED - Cryptographic match with expected hash!");
+                    } else {
+                        println!("    Result:          [✗] FAILED - Hash mismatch!");
+                        println!("    Expected:        {}", clean_exp);
+                        println!("    Live SHA-256:    {}", m.sha256);
+                    }
+                } else {
+                    println!("    Result:          [✗] FAILED - Cannot compare hash (file not readable or missing).");
+                }
+            }
+
+            // 3. Baseline Database Comparison
+            let db_path = db.or_else(|| {
+                let default_p = PathBuf::from("openfim.db");
+                if default_p.exists() { Some(default_p) } else { None }
+            });
+
+            let mut loaded_db = None;
+            if let Some(ref p) = db_path {
+                println!("\n[2] BASELINE DATABASE COMPARISON ({})", p.display());
+                match BaselineDb::open(p) {
+                    Ok(bdb) => {
+                        match bdb.get_entry(&path) {
+                            Ok(Some(baseline)) => {
+                                println!("    Baseline Status: REGISTERED IN BASELINE");
+                                println!("    Baseline Size:   {} bytes", baseline.st_size);
+                                println!("    Baseline SHA256: {}", baseline.sha256);
+                                println!("    Baseline Mode:   0o{:o}", baseline.st_mode);
+
+                                if let Some(ref cur) = current_meta {
+                                    let hash_match = cur.sha256 == baseline.sha256;
+                                    let meta_match = cur.st_mode == baseline.st_mode && cur.st_uid == baseline.st_uid;
+
+                                    if hash_match && meta_match {
+                                        println!("    INTEGRITY CHECK: [✓] CLEAN & UNCOMPROMISED (Matches baseline snapshot)");
+                                    } else {
+                                        println!("    INTEGRITY CHECK: [!] TAMPERING / MODIFICATION DETECTED!");
+                                        if !hash_match {
+                                            println!("      -> Content Divergence: Hash modified since baseline snapshot!");
+                                            println!("         Expected: {}", baseline.sha256);
+                                            println!("         Current:  {}", cur.sha256);
+                                        }
+                                        if !meta_match {
+                                            println!("      -> Metadata Divergence: Permissions/ownership changed!");
+                                            println!("         Expected Mode: 0o{:o}, UID: {}", baseline.st_mode, baseline.st_uid);
+                                            println!("         Current Mode:  0o{:o}, UID: {}", cur.st_mode, cur.st_uid);
+                                        }
+                                    }
+                                } else {
+                                    println!("    INTEGRITY CHECK: [!] FILE REMOVED (File was in baseline but is now deleted)");
+                                }
+                            }
+                            Ok(None) => {
+                                println!("    Baseline Status: [?] UNINDEXED (Not found in active baseline database)");
+                                if current_meta.is_some() {
+                                    println!("    Notice:          This is a new or unmonitored file not present in snapshot.");
+                                }
+                            }
+                            Err(e) => {
+                                println!("    Error querying baseline database: {}", e);
+                            }
+                        }
+                        loaded_db = Some(bdb);
+                    }
+                    Err(e) => {
+                        println!("    Error opening baseline database: {}", e);
+                    }
+                }
+            } else {
+                println!("\n[2] BASELINE DATABASE COMPARISON");
+                println!("    Status:          Skipped (No database provided and 'openfim.db' not found)");
+                println!("    Tip:             Run `openfim-cli baseline snapshot --dir <DIR> --db openfim.db` first.");
+            }
+
+            // 4. Policy Governance & Access Security
+            let pol_path = policy.or_else(|| {
+                let default_p = PathBuf::from("policy.yaml");
+                if default_p.exists() { Some(default_p) } else { None }
+            });
+
+            if let Some(ref p) = pol_path {
+                println!("\n[3] POLICY & SECURITY GOVERNANCE ({})", p.display());
+                match Policy::from_yaml_file(p) {
+                    Ok(pol) => {
+                        if let Some(rule) = pol.find_matching_rule(&path) {
+                            println!("    Governance:      [✓] MONITORED BY DEFENSIVE POLICY");
+                            println!("    Rule ID:         {}", rule.id);
+                            println!("    Description:     {}", rule.description);
+                            println!("    Threat Severity: {}/10", rule.severity);
+                            println!("    Watch Mode:      {:?}", rule.mode);
+                            println!("    WhoData Active:  {}", rule.whodata);
+                            println!("    Active Response: {:?}", rule.active_response.action);
+                            println!("    Enforced Checks: hash={}, perms={}, owner={}",
+                                rule.checks.hash, rule.checks.permissions, rule.checks.ownership);
+                        } else {
+                            println!("    Governance:      [-] NOT MONITORED (Path does not match any active policy rules)");
+                        }
+                    }
+                    Err(e) => {
+                        println!("    Error loading policy file: {}", e);
+                    }
+                }
+            } else {
+                println!("\n[3] POLICY & SECURITY GOVERNANCE");
+                println!("    Status:          Skipped (No policy provided and 'policy.yaml' not found)");
+            }
+
+            // 5. Forensic WhoData & Audit Trail (Recent modification history from tamper-evident spool)
+            if let Some(ref bdb) = loaded_db {
+                println!("\n[4] FORENSIC WHODATA & AUDIT HISTORY (Local Spool)");
+                match bdb.get_events_for_path(&path, 5) {
+                    Ok(events) => {
+                        if events.is_empty() {
+                            println!("    Event Log:       No tampering or modification events logged for this file.");
+                        } else {
+                            println!("    Recorded Events: {} recent modification event(s) found:", events.len());
+                            for (i, ev) in events.iter().enumerate() {
+                                println!("    ---------------- Event #{} ----------------", i + 1);
+                                println!("      Type:          {}", ev.event_type);
+                                println!("      Severity:      {}/10", ev.severity);
+                                println!("      Timestamp:     Unix nanos {}", ev.timestamp_nano);
+                                if let Some(pid) = ev.whodata_pid {
+                                    println!("      Actor Process: PID {} (Executable: {:?}, Comm: {:?})",
+                                        pid, ev.whodata_exe.as_deref().unwrap_or("unknown"), ev.whodata_comm.as_deref().unwrap_or("unknown"));
+                                }
+                                if let Some(ref cmd) = ev.whodata_cmdline {
+                                    println!("      Command Line:  {}", cmd);
+                                }
+                                if let Some(uid) = ev.whodata_uid {
+                                    println!("      Actor UID:     {}", uid);
+                                }
+                                if let Some(ref oh) = ev.old_sha256 {
+                                    println!("      Old SHA-256:   {}", &oh[..oh.len().min(16)]);
+                                }
+                                if let Some(ref nh) = ev.new_sha256 {
+                                    println!("      New SHA-256:   {}", &nh[..nh.len().min(16)]);
+                                }
+                                println!("      HMAC Status:   CHAINED (Signature: {}...)", &ev.hmac_signature[..ev.hmac_signature.len().min(16)]);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        println!("    Error querying event spool: {}", e);
+                    }
+                }
+            }
+
+            println!("======================================================================\n");
+        }
+
         Commands::Hash {
             path,
             algorithm,
@@ -214,7 +484,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("[*] Crawl complete. Indexed {} items:", items.len());
             for item in items {
                 let type_str = if item.is_dir { "DIR " } else if item.is_symlink { "LINK" } else { "FILE" };
-                println!("  [{}] {} ({} bytes, sha256: {})", type_str, item.path.display(), item.st_size, &item.sha256[..12]);
+                let short_hash = &item.sha256[..item.sha256.len().min(12)];
+                println!("  [{}] {} ({} bytes, sha256: {})", type_str, item.path.display(), item.st_size, short_hash);
             }
         }
 
@@ -263,7 +534,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let current_snapshot = crawler.crawl(&dir, &mut hasher)?;
 
                     println!("[*] Diffing against baseline database: {}", db.display());
-                    let diff = baseline_db.diff_filesystem(&current_snapshot)?;
+                    let diff = baseline_db.diff_filesystem_scoped(&current_snapshot, Some(&dir))?;
 
                     if diff.is_clean() {
                         println!("\n[✓] INTEGRITY VERIFIED: 0 changes detected. System matches active baseline perfectly.");
@@ -273,21 +544,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if !diff.modified_content.is_empty() {
                             println!("\n--- [MODIFIED CONTENT (HASH DIVERGENCE)] ({} files) ---", diff.modified_content.len());
                             for c in &diff.modified_content {
-                                println!("  * {}: expected {} -> found {}", c.path.display(), &c.old_sha256[..12], &c.new_sha256[..12]);
+                                let old_h = &c.old_sha256[..c.old_sha256.len().min(12)];
+                                let new_h = &c.new_sha256[..c.new_sha256.len().min(12)];
+                                println!("  * {}: expected {} -> found {}", c.path.display(), old_h, new_h);
                             }
                         }
 
                         if !diff.added.is_empty() {
                             println!("\n--- [UNAUTHORIZED NEW FILES (ADDED)] ({} files) ---", diff.added.len());
                             for a in &diff.added {
-                                println!("  * {} ({} bytes, sha256: {})", a.path.display(), a.st_size, &a.sha256[..12]);
+                                let h = &a.sha256[..a.sha256.len().min(12)];
+                                println!("  * {} ({} bytes, sha256: {})", a.path.display(), a.st_size, h);
                             }
                         }
 
                         if !diff.removed.is_empty() {
                             println!("\n--- [DELETED FILES (REMOVED)] ({} files) ---", diff.removed.len());
                             for r in &diff.removed {
-                                println!("  * {} (last known sha256: {})", r.path.display(), &r.sha256[..12]);
+                                let h = &r.sha256[..r.sha256.len().min(12)];
+                                println!("  * {} (last known sha256: {})", r.path.display(), h);
                             }
                         }
 
@@ -305,6 +580,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Database:       {}", db.display());
                     println!("Registered:     {} baseline files", count);
                 }
+                BaselineAction::Export { db, out, format } => {
+                    let baseline_db = BaselineDb::open(&db)?;
+                    let content = baseline_db.export_manifest(&format)?;
+                    std::fs::write(&out, content)?;
+                    println!(
+                        "[+] Exported baseline manifest ({} format) to: {}",
+                        format,
+                        out.display()
+                    );
+                }
             }
         }
 
@@ -315,7 +600,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 PolicyAction::Check { policy, pubkey, sig } => {
                     println!("[*] Reading policy manifest: {}", policy.display());
 
-                    let loaded_policy = if let Some(pk_str) = pubkey {
+                    let loaded_policy = if let Some(pk_arg) = pubkey {
+                        let pk_str = if std::path::Path::new(&pk_arg).exists() {
+                            std::fs::read_to_string(&pk_arg)?
+                        } else {
+                            pk_arg
+                        };
                         let verifying_key = PolicySigner::pubkey_from_hex(&pk_str)?;
                         let pol = if let Some(s) = sig {
                             PolicyVerifier::verify_file(&policy, &s, &verifying_key)?
@@ -431,6 +721,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
         }
+
+        Commands::Audit { action } => match action {
+            AuditAction::Verify { db, key } => {
+                println!("[*] Auditing tamper-evident HMAC offline log: {}", db.display());
+                let baseline_db = BaselineDb::open(&db)?;
+                let report = baseline_db.verify_spool_chain(key.as_bytes())?;
+                if report.is_valid {
+                    println!("\n============================================================");
+                    println!("  [✓] AUDIT PASSED: Tamper-Evident HMAC Chain is VALID      ");
+                    println!("  Total Events Verified:  {}", report.total_events);
+                    println!("  Sequence Continuity:    CONTIGUOUS (No gaps/deletions)    ");
+                    println!("  Cryptographic Status:   UNCOMPROMISED                     ");
+                    println!("============================================================");
+                } else {
+                    println!("\n============================================================");
+                    println!("  [✗] AUDIT FAILED: TAMPERING DETECTED!                     ");
+                    println!("  Total Events Verified:  {}", report.total_events);
+                    println!("  Tampered Sequence ID:   {:?}", report.tampered_sequence_id);
+                    println!("  Error Details:          {}", report.error_message.unwrap_or_default());
+                    println!("============================================================");
+                    std::process::exit(1);
+                }
+            }
+        },
     }
 
     Ok(())

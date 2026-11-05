@@ -12,6 +12,8 @@ pub struct CrawlOptions {
     pub max_depth: usize,
     /// Follow directory symlinks (default: false to prevent symlink recursion loops)
     pub follow_symlinks: bool,
+    /// Skip unreadable / permission denied files instead of aborting the crawl
+    pub skip_inaccessible: bool,
     /// Compiled glob patterns for ignored files/paths
     pub ignore_patterns: Vec<Pattern>,
 }
@@ -21,6 +23,7 @@ impl Default for CrawlOptions {
         Self {
             max_depth: 64,
             follow_symlinks: false,
+            skip_inaccessible: false,
             ignore_patterns: Vec::new(),
         }
     }
@@ -79,7 +82,8 @@ impl FileCrawler {
     ) -> Result<Vec<FileMetadata>> {
         let root_path = root.as_ref().to_path_buf();
         let mut results = Vec::new();
-        self.crawl_recursive(&root_path, 0, hasher, &mut results)?;
+        let mut visited_dirs = std::collections::HashSet::new();
+        self.crawl_recursive(&root_path, 0, hasher, &mut results, &mut visited_dirs)?;
         Ok(results)
     }
 
@@ -89,6 +93,7 @@ impl FileCrawler {
         current_depth: usize,
         hasher: &mut StreamHasher,
         results: &mut Vec<FileMetadata>,
+        visited_dirs: &mut std::collections::HashSet<(u64, u64)>,
     ) -> Result<()> {
         if self.options.is_ignored(current_path) {
             return Ok(());
@@ -102,7 +107,9 @@ impl FileCrawler {
         let meta = match FileMetadata::extract(current_path, hasher) {
             Ok(m) => m,
             Err(e) => {
-                // If a transient read error occurs (e.g. permission denied on locked file), record error or skip
+                if self.options.skip_inaccessible {
+                    return Ok(());
+                }
                 return Err(e);
             }
         };
@@ -110,13 +117,21 @@ impl FileCrawler {
         let is_dir = meta.is_dir;
         let is_symlink = meta.is_symlink;
 
-        results.push(meta);
+        results.push(meta.clone());
 
         // If it's a directory (and not a symlink, unless follow_symlinks is true), walk children
         if is_dir && (!is_symlink || self.options.follow_symlinks) {
+            // Guard against symlink recursion cycles
+            if !visited_dirs.insert((meta.st_dev, meta.st_ino)) {
+                return Ok(());
+            }
+
             let entries = match std::fs::read_dir(current_path) {
                 Ok(rd) => rd,
                 Err(e) => {
+                    if self.options.skip_inaccessible {
+                        return Ok(());
+                    }
                     return Err(OpenFimError::IoError {
                         path: current_path.to_path_buf(),
                         source: e,
@@ -125,12 +140,20 @@ impl FileCrawler {
             };
 
             for entry in entries {
-                let entry = entry.map_err(|e| OpenFimError::IoError {
-                    path: current_path.to_path_buf(),
-                    source: e,
-                })?;
+                let entry = match entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        if self.options.skip_inaccessible {
+                            continue;
+                        }
+                        return Err(OpenFimError::IoError {
+                            path: current_path.to_path_buf(),
+                            source: e,
+                        });
+                    }
+                };
                 let child_path = entry.path();
-                self.crawl_recursive(&child_path, current_depth + 1, hasher, results)?;
+                self.crawl_recursive(&child_path, current_depth + 1, hasher, results, visited_dirs)?;
             }
         }
 
