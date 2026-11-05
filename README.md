@@ -49,3 +49,11 @@ The console opens with a Metasploit-style cyber defense banner, status statistic
 
 *Security Retry Rule*: Entering an invalid option displays an alert in red text and allows up to 3 tries before initiating security lockout and terminating.
 
+
+---
+
+## License
+
+OpenFIM is licensed under the **Apache License, Version 2.0**. See [`LICENSE`](file:///d:/VibeCode/file_integrity/LICENSE) for the full text.
+
+This matches the `license = "Apache-2.0"` declaration in the workspace `Cargo.toml`, and includes an explicit patent grant — allowing the agent to be deployed, embedded, and redistributed in commercial environments without copyleft obligations.
