@@ -1,5 +1,5 @@
-use std::path::Path;
 use glob::Pattern;
+use std::path::Path;
 
 use crate::error::{OpenFimError, Result};
 use crate::hasher::StreamHasher;
@@ -88,7 +88,11 @@ impl CrawlOptions {
         for p in patterns {
             let normalized = normalize_pattern(p.as_ref());
             let pat = Pattern::new(&normalized).map_err(|e| {
-                OpenFimError::Other(format!("Invalid glob ignore pattern '{}': {}", p.as_ref(), e))
+                OpenFimError::Other(format!(
+                    "Invalid glob ignore pattern '{}': {}",
+                    p.as_ref(),
+                    e
+                ))
             })?;
             self.ignore_patterns.push(pat);
         }
@@ -222,7 +226,13 @@ impl FileCrawler {
                     }
                 };
                 let child_path = entry.path();
-                self.crawl_recursive(&child_path, current_depth + 1, hasher, results, visited_dirs)?;
+                self.crawl_recursive(
+                    &child_path,
+                    current_depth + 1,
+                    hasher,
+                    results,
+                    visited_dirs,
+                )?;
             }
         }
 
@@ -278,7 +288,10 @@ mod tests {
 
         assert!(paths.contains(&"app.exe".to_string()));
         assert!(paths.contains(&"config.yaml".to_string()));
-        assert!(!paths.contains(&"temp.tmp".to_string()), "Ignored file temp.tmp was crawled!");
+        assert!(
+            !paths.contains(&"temp.tmp".to_string()),
+            "Ignored file temp.tmp was crawled!"
+        );
     }
 
     #[test]

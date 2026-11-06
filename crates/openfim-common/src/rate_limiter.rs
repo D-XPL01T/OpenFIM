@@ -125,7 +125,11 @@ mod tests {
         // Request 50 KB -> should take approx 0.5 seconds
         limiter.consume(50 * 1024);
         let elapsed = start.elapsed();
-        assert!(elapsed >= Duration::from_millis(400), "Elapsed time was {:?}", elapsed);
+        assert!(
+            elapsed >= Duration::from_millis(400),
+            "Elapsed time was {:?}",
+            elapsed
+        );
     }
 
     #[test]

@@ -1,6 +1,6 @@
-use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use openfim_common::{BaselineDb, FileMetadata, HashAlgorithm, Policy, StreamHasher, TokenBucket};
+use std::path::{Path, PathBuf};
 
 mod console;
 
@@ -97,9 +97,11 @@ pub(crate) fn resolve_audit_key(
             return Ok(trimmed.as_bytes().to_vec());
         }
     }
-    Err("No HMAC key supplied. Set OPENFIM_HMAC_KEY, or pass --key-file <PATH>. \
+    Err(
+        "No HMAC key supplied. Set OPENFIM_HMAC_KEY, or pass --key-file <PATH>. \
          The audit chain cannot be verified without the key it was signed with."
-        .into())
+            .into(),
+    )
 }
 
 #[derive(Parser, Debug)]
@@ -389,7 +391,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("File Status:         PRESENT ON DISK");
                 println!("File Size:           {} bytes", m.st_size);
                 println!("Permissions / Mode:  {}", format_mode(m.st_mode));
-                println!("Last Modified Time:  Unix timestamp {} (ctime: {})", m.st_mtime, m.st_ctime);
+                println!(
+                    "Last Modified Time:  Unix timestamp {} (ctime: {})",
+                    m.st_mtime, m.st_ctime
+                );
                 println!("Computed SHA-256:    {}", m.sha256);
                 if let Some(ref b3) = m.blake3 {
                     println!("Computed BLAKE3:     {}", b3);
@@ -416,7 +421,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 3. Baseline Database Comparison
             let db_path = db.or_else(|| {
                 let default_p = PathBuf::from("openfim.db");
-                if default_p.exists() { Some(default_p) } else { None }
+                if default_p.exists() {
+                    Some(default_p)
+                } else {
+                    None
+                }
             });
 
             let mut loaded_db = None;
@@ -433,7 +442,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                                 if let Some(ref cur) = current_meta {
                                     let hash_match = cur.sha256 == baseline.sha256;
-                                    let meta_match = cur.st_mode == baseline.st_mode && cur.st_uid == baseline.st_uid;
+                                    let meta_match = cur.st_mode == baseline.st_mode
+                                        && cur.st_uid == baseline.st_uid;
 
                                     if hash_match && meta_match {
                                         println!("    INTEGRITY CHECK: [✓] CLEAN & UNCOMPROMISED (Matches baseline snapshot)");
@@ -446,8 +456,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         if !meta_match {
                                             println!("      -> Metadata Divergence: Permissions/ownership changed!");
-                                            println!("         Expected Mode: {}, UID: {}", format_mode(baseline.st_mode), baseline.st_uid);
-                                            println!("         Current Mode:  {}, UID: {}", format_mode(cur.st_mode), cur.st_uid);
+                                            println!(
+                                                "         Expected Mode: {}, UID: {}",
+                                                format_mode(baseline.st_mode),
+                                                baseline.st_uid
+                                            );
+                                            println!(
+                                                "         Current Mode:  {}, UID: {}",
+                                                format_mode(cur.st_mode),
+                                                cur.st_uid
+                                            );
                                         }
                                     }
                                 } else {
@@ -479,7 +497,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 4. Policy Governance & Access Security
             let pol_path = policy.or_else(|| {
                 let default_p = PathBuf::from("policy.yaml");
-                if default_p.exists() { Some(default_p) } else { None }
+                if default_p.exists() {
+                    Some(default_p)
+                } else {
+                    None
+                }
             });
 
             if let Some(ref p) = pol_path {
@@ -494,8 +516,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("    Watch Mode:      {:?}", rule.mode);
                             println!("    WhoData Active:  {}", rule.whodata);
                             println!("    Active Response: {:?}", rule.active_response.action);
-                            println!("    Enforced Checks: hash={}, perms={}, owner={}",
-                                rule.checks.hash, rule.checks.permissions, rule.checks.ownership);
+                            println!(
+                                "    Enforced Checks: hash={}, perms={}, owner={}",
+                                rule.checks.hash, rule.checks.permissions, rule.checks.ownership
+                            );
                         } else {
                             println!("    Governance:      [-] NOT MONITORED (Path does not match any active policy rules)");
                         }
@@ -506,7 +530,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             } else {
                 println!("\n[3] POLICY & SECURITY GOVERNANCE");
-                println!("    Status:          Skipped (No policy provided and 'policy.yaml' not found)");
+                println!(
+                    "    Status:          Skipped (No policy provided and 'policy.yaml' not found)"
+                );
             }
 
             // 5. Forensic WhoData & Audit Trail (Recent modification history from tamper-evident spool)
@@ -517,7 +543,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         if events.is_empty() {
                             println!("    Event Log:       No tampering or modification events logged for this file.");
                         } else {
-                            println!("    Recorded Events: {} recent modification event(s) found:", events.len());
+                            println!(
+                                "    Recorded Events: {} recent modification event(s) found:",
+                                events.len()
+                            );
                             for (i, ev) in events.iter().enumerate() {
                                 println!("    ---------------- Event #{} ----------------", i + 1);
                                 println!("      Type:          {}", ev.event_type);
@@ -539,7 +568,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Some(ref nh) = ev.new_sha256 {
                                     println!("      New SHA-256:   {}", &nh[..nh.len().min(16)]);
                                 }
-                                println!("      HMAC Status:   CHAINED (Signature: {}...)", &ev.hmac_signature[..ev.hmac_signature.len().min(16)]);
+                                println!(
+                                    "      HMAC Status:   CHAINED (Signature: {}...)",
+                                    &ev.hmac_signature[..ev.hmac_signature.len().min(16)]
+                                );
                             }
                         }
                     }
@@ -592,9 +624,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let items = crawler.crawl(&path, &mut hasher)?;
             println!("[*] Crawl complete. Indexed {} items:", items.len());
             for item in items {
-                let type_str = if item.is_dir { "DIR " } else if item.is_symlink { "LINK" } else { "FILE" };
+                let type_str = if item.is_dir {
+                    "DIR "
+                } else if item.is_symlink {
+                    "LINK"
+                } else {
+                    "FILE"
+                };
                 let short_hash = &item.sha256[..item.sha256.len().min(12)];
-                println!("  [{}] {} ({} bytes, sha256: {})", type_str, item.path.display(), item.st_size, short_hash);
+                println!(
+                    "  [{}] {} ({} bytes, sha256: {})",
+                    type_str,
+                    item.path.display(),
+                    item.st_size,
+                    short_hash
+                );
             }
         }
 
@@ -604,7 +648,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match action {
                 BaselineAction::Init { db } => {
                     let _db = BaselineDb::open(&db)?;
-                    println!("[+] Initialized SQLite baseline database at: {}", db.display());
+                    println!(
+                        "[+] Initialized SQLite baseline database at: {}",
+                        db.display()
+                    );
                 }
                 BaselineAction::Snapshot {
                     dir,
@@ -622,7 +669,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("[*] Crawling target directory: {}", dir.display());
                     let snapshot = crawler.crawl(&dir, &mut hasher)?;
 
-                    println!("[*] Ingesting {} records into baseline database...", snapshot.len());
+                    println!(
+                        "[*] Ingesting {} records into baseline database...",
+                        snapshot.len()
+                    );
                     let inserted = baseline_db.insert_batch(&snapshot, &version)?;
                     println!(
                         "[+] Successfully recorded {} baseline entries under version '{}'. Total in DB: {}",
@@ -639,7 +689,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let crawler = FileCrawler::new(options);
                     let mut hasher = StreamHasher::default_sha256();
 
-                    println!("[*] Crawling filesystem for live verification: {}", dir.display());
+                    println!(
+                        "[*] Crawling filesystem for live verification: {}",
+                        dir.display()
+                    );
                     let current_snapshot = crawler.crawl(&dir, &mut hasher)?;
 
                     println!("[*] Diffing against baseline database: {}", db.display());
@@ -648,27 +701,49 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     if diff.is_clean() {
                         println!("\n[✓] INTEGRITY VERIFIED: 0 changes detected. System matches active baseline perfectly.");
                     } else {
-                        println!("\n[!] INTEGRITY VIOLATION DETECTED! Total Changes: {}", diff.total_changes());
+                        println!(
+                            "\n[!] INTEGRITY VIOLATION DETECTED! Total Changes: {}",
+                            diff.total_changes()
+                        );
 
                         if !diff.modified_content.is_empty() {
-                            println!("\n--- [MODIFIED CONTENT (HASH DIVERGENCE)] ({} files) ---", diff.modified_content.len());
+                            println!(
+                                "\n--- [MODIFIED CONTENT (HASH DIVERGENCE)] ({} files) ---",
+                                diff.modified_content.len()
+                            );
                             for c in &diff.modified_content {
                                 let old_h = &c.old_sha256[..c.old_sha256.len().min(12)];
                                 let new_h = &c.new_sha256[..c.new_sha256.len().min(12)];
-                                println!("  * {}: expected {} -> found {}", c.path.display(), old_h, new_h);
+                                println!(
+                                    "  * {}: expected {} -> found {}",
+                                    c.path.display(),
+                                    old_h,
+                                    new_h
+                                );
                             }
                         }
 
                         if !diff.added.is_empty() {
-                            println!("\n--- [UNAUTHORIZED NEW FILES (ADDED)] ({} files) ---", diff.added.len());
+                            println!(
+                                "\n--- [UNAUTHORIZED NEW FILES (ADDED)] ({} files) ---",
+                                diff.added.len()
+                            );
                             for a in &diff.added {
                                 let h = &a.sha256[..a.sha256.len().min(12)];
-                                println!("  * {} ({} bytes, sha256: {})", a.path.display(), a.st_size, h);
+                                println!(
+                                    "  * {} ({} bytes, sha256: {})",
+                                    a.path.display(),
+                                    a.st_size,
+                                    h
+                                );
                             }
                         }
 
                         if !diff.removed.is_empty() {
-                            println!("\n--- [DELETED FILES (REMOVED)] ({} files) ---", diff.removed.len());
+                            println!(
+                                "\n--- [DELETED FILES (REMOVED)] ({} files) ---",
+                                diff.removed.len()
+                            );
                             for r in &diff.removed {
                                 let h = &r.sha256[..r.sha256.len().min(12)];
                                 println!("  * {} (last known sha256: {})", r.path.display(), h);
@@ -676,9 +751,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         }
 
                         if !diff.modified_metadata.is_empty() {
-                            println!("\n--- [MODIFIED PERMISSIONS / ATTRIBUTES] ({} files) ---", diff.modified_metadata.len());
+                            println!(
+                                "\n--- [MODIFIED PERMISSIONS / ATTRIBUTES] ({} files) ---",
+                                diff.modified_metadata.len()
+                            );
                             for m in &diff.modified_metadata {
-                                println!("  * {}: mode {:o} -> {:o}, uid {} -> {}", m.path.display(), m.old_mode, m.new_mode, m.old_uid, m.new_uid);
+                                println!(
+                                    "  * {}: mode {:o} -> {:o}, uid {} -> {}",
+                                    m.path.display(),
+                                    m.old_mode,
+                                    m.new_mode,
+                                    m.old_uid,
+                                    m.new_uid
+                                );
                             }
                         }
                     }
@@ -706,7 +791,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             use openfim_common::{Policy, PolicySigner, PolicyVerifier};
 
             match action {
-                PolicyAction::Check { policy, pubkey, sig } => {
+                PolicyAction::Check {
+                    policy,
+                    pubkey,
+                    sig,
+                } => {
                     println!("[*] Reading policy manifest: {}", policy.display());
 
                     let loaded_policy = if let Some(pk_arg) = pubkey {
@@ -733,9 +822,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("Name:                {}", loaded_policy.name);
                     println!("Author:              {}", loaded_policy.author);
                     println!("Signature Algorithm: {}", loaded_policy.signature_algorithm);
-                    println!("Default Hashing:     {}", loaded_policy.globals.default_hash);
-                    println!("Max I/O Scan Rate:   {} MB/s", loaded_policy.globals.max_io_rate_mb_s);
-                    println!("Sweep Interval:      {} seconds", loaded_policy.globals.realtime_fallback_sweep_interval);
+                    println!(
+                        "Default Hashing:     {}",
+                        loaded_policy.globals.default_hash
+                    );
+                    println!(
+                        "Max I/O Scan Rate:   {} MB/s",
+                        loaded_policy.globals.max_io_rate_mb_s
+                    );
+                    println!(
+                        "Sweep Interval:      {} seconds",
+                        loaded_policy.globals.realtime_fallback_sweep_interval
+                    );
                     println!("Total Rules Defined: {}", loaded_policy.rules.len());
 
                     let roots = loaded_policy.get_monitored_roots();
@@ -748,7 +846,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     for rule in &loaded_policy.rules {
                         println!(
                             "  [{:2}] {} (mode: {:?}, nodiff: {}, action: {:?})",
-                            rule.severity, rule.id, rule.mode, rule.nodiff, rule.active_response.action
+                            rule.severity,
+                            rule.id,
+                            rule.mode,
+                            rule.nodiff,
+                            rule.active_response.action
                         );
                     }
                     println!("=================================================\n");
@@ -803,19 +905,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     let out_path = out.unwrap_or_else(|| {
                         let mut p = policy.clone();
-                        let ext = p.extension().map_or("sig".to_string(), |e| format!("{}.sig", e.to_string_lossy()));
+                        let ext = p.extension().map_or("sig".to_string(), |e| {
+                            format!("{}.sig", e.to_string_lossy())
+                        });
                         p.set_extension(ext);
                         p
                     });
 
                     std::fs::write(&out_path, sig_hex.as_bytes())?;
                     println!("[+] Successfully signed policy file: {}", policy.display());
-                    println!("[+] Ed25519 Detached Signature written to: {}", out_path.display());
+                    println!(
+                        "[+] Ed25519 Detached Signature written to: {}",
+                        out_path.display()
+                    );
                 }
 
                 PolicyAction::TestPath { policy, path } => {
                     let pol = Policy::from_yaml_file(&policy)?;
-                    println!("[*] Testing path '{}' against policy '{}'...", path.display(), pol.policy_id);
+                    println!(
+                        "[*] Testing path '{}' against policy '{}'...",
+                        path.display(),
+                        pol.policy_id
+                    );
 
                     if let Some(rule) = pol.find_matching_rule(&path) {
                         println!("\n[✓] PATH MONITORED: Integrity rule matched!");
@@ -844,7 +955,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         Commands::Audit { action } => match action {
             AuditAction::Verify { db, key, key_file } => {
-                println!("[*] Auditing tamper-evident HMAC offline log: {}", db.display());
+                println!(
+                    "[*] Auditing tamper-evident HMAC offline log: {}",
+                    db.display()
+                );
                 let audit_key = resolve_audit_key(key.as_deref(), key_file.as_deref())?;
                 let baseline_db = BaselineDb::open(&db)?;
                 let report = baseline_db.verify_spool_chain(&audit_key)?;
@@ -859,8 +973,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("\n============================================================");
                     println!("  [✗] AUDIT FAILED: TAMPERING DETECTED!                     ");
                     println!("  Total Events Verified:  {}", report.total_events);
-                    println!("  Tampered Sequence ID:   {:?}", report.tampered_sequence_id);
-                    println!("  Error Details:          {}", report.error_message.unwrap_or_default());
+                    println!(
+                        "  Tampered Sequence ID:   {:?}",
+                        report.tampered_sequence_id
+                    );
+                    println!(
+                        "  Error Details:          {}",
+                        report.error_message.unwrap_or_default()
+                    );
                     println!("============================================================");
                     std::process::exit(1);
                 }

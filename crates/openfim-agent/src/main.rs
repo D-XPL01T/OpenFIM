@@ -91,11 +91,13 @@ fn resolve_hmac_key(args: &Args) -> Result<Vec<u8>, Box<dyn std::error::Error>> 
 
     match args.hmac_key.as_deref().map(str::trim) {
         Some(k) if !k.is_empty() => Ok(k.as_bytes().to_vec()),
-        _ => Err("No HMAC key supplied. The tamper-evident event log cannot be signed \
+        _ => Err(
+            "No HMAC key supplied. The tamper-evident event log cannot be signed \
                   without one, and shipping a default key would let anyone holding this \
                   binary forge the audit chain. Set OPENFIM_HMAC_KEY, or pass \
                   --hmac-key-file <PATH>."
-            .into()),
+                .into(),
+        ),
     }
 }
 
@@ -238,7 +240,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            println!("\n[*] Received shutdown signal (Ctrl+C). Terminating OpenFIM agent gracefully.");
+            println!(
+                "\n[*] Received shutdown signal (Ctrl+C). Terminating OpenFIM agent gracefully."
+            );
             shutdown_signal.store(true, Ordering::SeqCst);
         }
     });
@@ -265,8 +269,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         hmac_key,
     };
 
-    let handle =
-        tokio::task::spawn_blocking(move || sensor_loop(rx, db, compiled, guard, loop_cfg, shutdown));
+    let handle = tokio::task::spawn_blocking(move || {
+        sensor_loop(rx, db, compiled, guard, loop_cfg, shutdown)
+    });
 
     // Propagate a panic in the blocking task as an error rather than hanging.
     handle.await?;
@@ -499,11 +504,7 @@ fn apply_remediation(
     if !cfg.remediation {
         return;
     }
-    match guard.execute(
-        rule.active_response.action,
-        path,
-        cfg.backup_dir.as_deref(),
-    ) {
+    match guard.execute(rule.active_response.action, path, cfg.backup_dir.as_deref()) {
         Ok(outcome) => println!("    [REMEDIATION] {}", outcome),
         Err(e) => eprintln!("    [REMEDIATION] failed: {}", e),
     }

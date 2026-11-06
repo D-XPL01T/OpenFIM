@@ -157,4 +157,3 @@ mod tests {
         assert!(ctx.exe.is_some() || ctx.comm.is_some());
     }
 }
-

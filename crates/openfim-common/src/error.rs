@@ -20,7 +20,9 @@ pub enum OpenFimError {
     #[error("Unsupported or cryptographically deprecated hashing algorithm: {0}")]
     UnsupportedAlgorithm(String),
 
-    #[error("Rate limiter violation: requested {requested_bytes} bytes exceeds bucket size {capacity}")]
+    #[error(
+        "Rate limiter violation: requested {requested_bytes} bytes exceeds bucket size {capacity}"
+    )]
     RateLimiterExceeded {
         requested_bytes: usize,
         capacity: usize,

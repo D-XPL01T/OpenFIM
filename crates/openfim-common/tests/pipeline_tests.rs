@@ -1,7 +1,7 @@
+use sha2::{Digest, Sha256};
 use std::io::Write;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
-use sha2::{Digest, Sha256};
 
 use openfim_common::{
     ActiveResponseAction, BaselineDb, CrawlOptions, FileCrawler, FileMetadata, HashAlgorithm,
@@ -10,9 +10,18 @@ use openfim_common::{
 
 #[test]
 fn test_day1_workspace_and_algorithm_parsing() {
-    assert_eq!("sha256".parse::<HashAlgorithm>().unwrap(), HashAlgorithm::Sha256);
-    assert_eq!("blake3".parse::<HashAlgorithm>().unwrap(), HashAlgorithm::Blake3);
-    assert_eq!("sha512".parse::<HashAlgorithm>().unwrap(), HashAlgorithm::Sha512);
+    assert_eq!(
+        "sha256".parse::<HashAlgorithm>().unwrap(),
+        HashAlgorithm::Sha256
+    );
+    assert_eq!(
+        "blake3".parse::<HashAlgorithm>().unwrap(),
+        HashAlgorithm::Blake3
+    );
+    assert_eq!(
+        "sha512".parse::<HashAlgorithm>().unwrap(),
+        HashAlgorithm::Sha512
+    );
 
     match "md5".parse::<HashAlgorithm>() {
         Err(OpenFimError::UnsupportedAlgorithm(msg)) => {
@@ -39,7 +48,9 @@ fn test_day2_bounded_streaming_hasher() {
     file.flush().unwrap();
 
     let mut hasher = StreamHasher::default_sha256().with_buffer_size(DEFAULT_BUFFER_SIZE);
-    let result = hasher.hash_file(file.path()).expect("Streaming hash should succeed");
+    let result = hasher
+        .hash_file(file.path())
+        .expect("Streaming hash should succeed");
 
     assert_eq!(result.algorithm, HashAlgorithm::Sha256);
     assert_eq!(result.bytes_read, 500 * 1024);
@@ -76,16 +87,23 @@ fn test_day2_rate_limiter_throttling() {
 #[test]
 fn test_day2_metadata_extraction() {
     let mut file = NamedTempFile::new().unwrap();
-    file.write_all(b"Hello OpenFIM Defensive Architecture\n").unwrap();
+    file.write_all(b"Hello OpenFIM Defensive Architecture\n")
+        .unwrap();
     file.flush().unwrap();
 
     let mut hasher = StreamHasher::default_sha256();
     let meta = FileMetadata::extract(file.path(), &mut hasher).unwrap();
 
-    assert_eq!(meta.st_size, b"Hello OpenFIM Defensive Architecture\n".len() as u64);
+    assert_eq!(
+        meta.st_size,
+        b"Hello OpenFIM Defensive Architecture\n".len() as u64
+    );
     assert!(!meta.is_dir);
     assert!(!meta.is_symlink);
-    assert_eq!(meta.sha256, hex::encode(Sha256::digest(b"Hello OpenFIM Defensive Architecture\n")));
+    assert_eq!(
+        meta.sha256,
+        hex::encode(Sha256::digest(b"Hello OpenFIM Defensive Architecture\n"))
+    );
 
     let json = serde_json::to_string(&meta).unwrap();
     assert!(json.contains("st_size"));
@@ -173,9 +191,7 @@ fn test_day4_sqlite_baseline_diff_pipeline() {
 
 #[test]
 fn test_day5_declarative_policy_and_signature_pipeline() {
-    use openfim_common::{
-        ActiveResponseAction, PolicySigner, PolicyVerifier, RuleMode,
-    };
+    use openfim_common::{ActiveResponseAction, PolicySigner, PolicyVerifier, RuleMode};
     use tempfile::tempdir;
 
     let dir = tempdir().unwrap();
@@ -277,8 +293,7 @@ rules:
 
     // 5. Test key mismatch: verify against an untrusted public key
     let (_untrusted_signing, untrusted_verifying) = PolicySigner::generate_keypair();
-    let untrusted_res =
-        PolicyVerifier::verify_file(&policy_path, &sig_path, &untrusted_verifying);
+    let untrusted_res = PolicyVerifier::verify_file(&policy_path, &sig_path, &untrusted_verifying);
     assert!(
         untrusted_res.is_err(),
         "Policy signed by Admin must be rejected when verified against untrusted key"
@@ -317,7 +332,10 @@ fn test_day6_adversary_timestomp_detection() {
     assert!(!diff.is_clean());
     assert_eq!(diff.modified_content.len(), 1);
     assert_eq!(diff.modified_content[0].path, target);
-    assert_ne!(diff.modified_content[0].old_sha256, diff.modified_content[0].new_sha256);
+    assert_ne!(
+        diff.modified_content[0].old_sha256,
+        diff.modified_content[0].new_sha256
+    );
 }
 
 #[test]
@@ -380,13 +398,24 @@ fn test_day7_adversary_tamper_evident_spool_hmac_audit() {
     }
 
     // Force sequence_id gap to simulate row deletion in raw sqlite
-    del_db.connection().execute("UPDATE event_spool SET sequence_id = 99 WHERE sequence_id = 4", []).unwrap();
+    del_db
+        .connection()
+        .execute(
+            "UPDATE event_spool SET sequence_id = 99 WHERE sequence_id = 4",
+            [],
+        )
+        .unwrap();
     let gap_audit = del_db.verify_spool_chain(key).unwrap();
     assert!(!gap_audit.is_valid);
     assert!(gap_audit.error_message.unwrap().contains("Sequence gap"));
 
     // Attack Scenario B: Adversary modifies path of record in place
-    db.connection().execute("UPDATE event_spool SET path = '/bin/tampered' WHERE sequence_id = 4", []).unwrap();
+    db.connection()
+        .execute(
+            "UPDATE event_spool SET path = '/bin/tampered' WHERE sequence_id = 4",
+            [],
+        )
+        .unwrap();
     let tampered_audit = db.verify_spool_chain(key).unwrap();
     assert!(!tampered_audit.is_valid);
     assert_eq!(tampered_audit.tampered_sequence_id, Some(4));
@@ -404,7 +433,9 @@ fn test_day8_active_response_quarantine_and_restore() {
     std::fs::write(&pristine_backup, b"PRISTINE SCRIPT").unwrap();
 
     // 1. Test Quarantine
-    let res = ActiveResponseAction::Quarantine.execute(&target_file, None).unwrap();
+    let res = ActiveResponseAction::Quarantine
+        .execute(&target_file, None)
+        .unwrap();
     assert!(res.was_applied(), "{}", res.message());
     assert!(res.message().contains("quarantined"));
     assert!(!target_file.exists()); // Original compromised file removed
@@ -430,7 +461,10 @@ fn test_day8_active_response_quarantine_and_restore() {
         .execute(&unbacked, Some(backup_dir.path()))
         .unwrap();
     assert!(!declined.was_applied());
-    assert!(unbacked.exists(), "a failed restore must not remove the live file");
+    assert!(
+        unbacked.exists(),
+        "a failed restore must not remove the live file"
+    );
     assert_eq!(std::fs::read(&unbacked).unwrap(), b"LIVE DATA");
 }
 
@@ -507,7 +541,11 @@ fn test_adversary_cannot_erase_evidence_by_truncating_the_log() {
              delete the events that incriminate them and still pass the audit"
         );
         let msg = report.error_message.unwrap();
-        assert!(msg.contains("truncation"), "unexpected failure reason: {}", msg);
+        assert!(
+            msg.contains("truncation"),
+            "unexpected failure reason: {}",
+            msg
+        );
     }
 }
 
@@ -552,5 +590,3 @@ fn test_concurrent_readers_and_writer_do_not_deadlock() {
 
     assert_eq!(reader_db.count_spool_events().unwrap(), 20);
 }
-
-

@@ -1,9 +1,9 @@
-use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
 use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 
 use crate::error::Result;
 use crate::metadata::FileMetadata;
@@ -141,12 +141,20 @@ pub fn compute_event_hmac_for(key: &[u8], prev_hmac: &str, event: &SpoolEvent) -
     mac_field(
         &mut mac,
         b"whodata_pid",
-        event.whodata_pid.map(|v| v.to_le_bytes()).as_ref().map(|b| &b[..]),
+        event
+            .whodata_pid
+            .map(|v| v.to_le_bytes())
+            .as_ref()
+            .map(|b| &b[..]),
     );
     mac_field(
         &mut mac,
         b"whodata_uid",
-        event.whodata_uid.map(|v| v.to_le_bytes()).as_ref().map(|b| &b[..]),
+        event
+            .whodata_uid
+            .map(|v| v.to_le_bytes())
+            .as_ref()
+            .map(|b| &b[..]),
     );
     mac_field(
         &mut mac,
@@ -269,8 +277,7 @@ impl BaselineDb {
         // expected to run `audit verify` and `baseline diff` against the same file.
         // With SQLite's default zero timeout, those concurrent commands fail outright
         // with SQLITE_BUSY ("database is locked") rather than waiting their turn.
-        self.conn
-            .busy_timeout(std::time::Duration::from_secs(10))?;
+        self.conn.busy_timeout(std::time::Duration::from_secs(10))?;
 
         self.conn.execute_batch(
             r#"
@@ -401,7 +408,11 @@ impl BaselineDb {
     }
 
     /// Bulk inserts an array of baseline entries inside a single ACID transaction
-    pub fn insert_batch(&mut self, entries: &[FileMetadata], manifest_version: &str) -> Result<usize> {
+    pub fn insert_batch(
+        &mut self,
+        entries: &[FileMetadata],
+        manifest_version: &str,
+    ) -> Result<usize> {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
@@ -579,9 +590,8 @@ impl BaselineDb {
         scope: Option<P>,
     ) -> Result<BaselineDiff> {
         let baseline_entries = self.get_all_entries()?;
-        let mut baseline_map: HashMap<String, FileMetadata> = HashMap::with_capacity(
-            baseline_entries.len(),
-        );
+        let mut baseline_map: HashMap<String, FileMetadata> =
+            HashMap::with_capacity(baseline_entries.len());
         for b in baseline_entries {
             baseline_map.insert(normalize_path_str(&b.path), b);
         }
@@ -750,9 +760,9 @@ impl BaselineDb {
 
     /// Retrieves the most recent HMAC signature from the event spool (or 64 zeros for genesis)
     pub fn get_last_spool_hmac(&self) -> Result<String> {
-        let mut stmt = self.conn.prepare(
-            "SELECT hmac_signature FROM event_spool ORDER BY sequence_id DESC LIMIT 1",
-        )?;
+        let mut stmt = self
+            .conn
+            .prepare("SELECT hmac_signature FROM event_spool ORDER BY sequence_id DESC LIMIT 1")?;
         let mut rows = stmt.query([])?;
         if let Some(row) = rows.next()? {
             Ok(row.get(0)?)
@@ -765,13 +775,20 @@ impl BaselineDb {
     ///
     /// The event row and the chain anchor are written in one transaction, so the
     /// anchor can never disagree with the chain because of a crash mid-append.
-    pub fn append_spool_event_chained(&self, event: &mut SpoolEvent, hmac_key: &[u8]) -> Result<i64> {
+    pub fn append_spool_event_chained(
+        &self,
+        event: &mut SpoolEvent,
+        hmac_key: &[u8],
+    ) -> Result<i64> {
         let tx = self.conn.unchecked_transaction()?;
 
         // Chain from the anchor when present; it is the authoritative head.
         let (prev_hmac, prev_count) = match self.read_chain_anchor()? {
             Some((_, last_hmac, count)) => (last_hmac, count),
-            None => (self.get_last_spool_hmac()?, self.count_spool_events()? as i64),
+            None => (
+                self.get_last_spool_hmac()?,
+                self.count_spool_events()? as i64,
+            ),
         };
 
         event.hmac_signature = compute_event_hmac_for(hmac_key, &prev_hmac, event);
@@ -938,7 +955,11 @@ impl BaselineDb {
     }
 
     /// Retrieves spool events for a specific path (most recent first)
-    pub fn get_events_for_path<P: AsRef<Path>>(&self, path: P, limit: usize) -> Result<Vec<SpoolEvent>> {
+    pub fn get_events_for_path<P: AsRef<Path>>(
+        &self,
+        path: P,
+        limit: usize,
+    ) -> Result<Vec<SpoolEvent>> {
         let path_ref = path.as_ref();
         let norm_str = normalize_path_str(path_ref);
         let abs_str = if let Ok(cur) = std::env::current_dir() {
@@ -1343,7 +1364,9 @@ mod tests {
     #[test]
     fn test_deleting_entire_log_is_detected() {
         let db = seeded_db(4);
-        db.connection().execute("DELETE FROM event_spool", []).unwrap();
+        db.connection()
+            .execute("DELETE FROM event_spool", [])
+            .unwrap();
         let report = db.verify_spool_chain(TEST_KEY).unwrap();
         assert!(!report.is_valid, "wiping the log must be detectable");
     }
@@ -1351,7 +1374,9 @@ mod tests {
     #[test]
     fn test_anchor_removal_is_detected() {
         let db = seeded_db(3);
-        db.connection().execute("DELETE FROM chain_meta", []).unwrap();
+        db.connection()
+            .execute("DELETE FROM chain_meta", [])
+            .unwrap();
         let report = db.verify_spool_chain(TEST_KEY).unwrap();
         assert!(!report.is_valid);
     }
@@ -1370,20 +1395,62 @@ mod tests {
     #[test]
     fn test_every_forensic_field_is_authenticated() {
         let mutations: &[(&str, &str)] = &[
-            ("severity", "UPDATE event_spool SET severity = 1 WHERE sequence_id = 2"),
-            ("path", "UPDATE event_spool SET path = '/etc/decoy' WHERE sequence_id = 2"),
-            ("event_type", "UPDATE event_spool SET event_type = 'FILE_CREATED' WHERE sequence_id = 2"),
-            ("event_id", "UPDATE event_spool SET event_id = 'forged' WHERE sequence_id = 2"),
-            ("timestamp_nano", "UPDATE event_spool SET timestamp_nano = 1 WHERE sequence_id = 2"),
-            ("whodata_pid", "UPDATE event_spool SET whodata_pid = 1 WHERE sequence_id = 2"),
-            ("whodata_uid", "UPDATE event_spool SET whodata_uid = 1000 WHERE sequence_id = 2"),
-            ("whodata_comm", "UPDATE event_spool SET whodata_comm = 'bash' WHERE sequence_id = 2"),
-            ("whodata_exe", "UPDATE event_spool SET whodata_exe = '/bin/bash' WHERE sequence_id = 2"),
-            ("whodata_cmdline", "UPDATE event_spool SET whodata_cmdline = 'ls' WHERE sequence_id = 2"),
-            ("whodata_cgroup", "UPDATE event_spool SET whodata_cgroup = '/system.slice' WHERE sequence_id = 2"),
-            ("old_sha256", "UPDATE event_spool SET old_sha256 = NULL WHERE sequence_id = 2"),
-            ("new_sha256", "UPDATE event_spool SET new_sha256 = NULL WHERE sequence_id = 2"),
-            ("diff_snippet", "UPDATE event_spool SET diff_snippet = 'injected' WHERE sequence_id = 2"),
+            (
+                "severity",
+                "UPDATE event_spool SET severity = 1 WHERE sequence_id = 2",
+            ),
+            (
+                "path",
+                "UPDATE event_spool SET path = '/etc/decoy' WHERE sequence_id = 2",
+            ),
+            (
+                "event_type",
+                "UPDATE event_spool SET event_type = 'FILE_CREATED' WHERE sequence_id = 2",
+            ),
+            (
+                "event_id",
+                "UPDATE event_spool SET event_id = 'forged' WHERE sequence_id = 2",
+            ),
+            (
+                "timestamp_nano",
+                "UPDATE event_spool SET timestamp_nano = 1 WHERE sequence_id = 2",
+            ),
+            (
+                "whodata_pid",
+                "UPDATE event_spool SET whodata_pid = 1 WHERE sequence_id = 2",
+            ),
+            (
+                "whodata_uid",
+                "UPDATE event_spool SET whodata_uid = 1000 WHERE sequence_id = 2",
+            ),
+            (
+                "whodata_comm",
+                "UPDATE event_spool SET whodata_comm = 'bash' WHERE sequence_id = 2",
+            ),
+            (
+                "whodata_exe",
+                "UPDATE event_spool SET whodata_exe = '/bin/bash' WHERE sequence_id = 2",
+            ),
+            (
+                "whodata_cmdline",
+                "UPDATE event_spool SET whodata_cmdline = 'ls' WHERE sequence_id = 2",
+            ),
+            (
+                "whodata_cgroup",
+                "UPDATE event_spool SET whodata_cgroup = '/system.slice' WHERE sequence_id = 2",
+            ),
+            (
+                "old_sha256",
+                "UPDATE event_spool SET old_sha256 = NULL WHERE sequence_id = 2",
+            ),
+            (
+                "new_sha256",
+                "UPDATE event_spool SET new_sha256 = NULL WHERE sequence_id = 2",
+            ),
+            (
+                "diff_snippet",
+                "UPDATE event_spool SET diff_snippet = 'injected' WHERE sequence_id = 2",
+            ),
         ];
 
         for (field, sql) in mutations {
@@ -1464,7 +1531,11 @@ mod tests {
         let mut ev = spool_event("evt-1", "/etc/passwd");
         let seq = db.append_spool_event_chained(&mut ev, TEST_KEY).unwrap();
         assert_eq!(seq, 1);
-        assert_eq!(ev.sequence_id, Some(1), "the event should carry its assigned sequence id");
+        assert_eq!(
+            ev.sequence_id,
+            Some(1),
+            "the event should carry its assigned sequence id"
+        );
         assert_eq!(db.count_spool_events().unwrap(), 1);
     }
 

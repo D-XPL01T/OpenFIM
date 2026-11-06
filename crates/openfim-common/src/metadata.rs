@@ -1,5 +1,5 @@
-use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
 
 use crate::error::{OpenFimError, Result};
 use crate::fsident;
@@ -93,7 +93,10 @@ impl FileMetadata {
             let target_bytes = symlink_target.as_deref().unwrap_or("").as_bytes();
             (
                 StreamHasher::hash_bytes(HashAlgorithm::Sha256, target_bytes),
-                Some(StreamHasher::hash_bytes(HashAlgorithm::Blake3, target_bytes)),
+                Some(StreamHasher::hash_bytes(
+                    HashAlgorithm::Blake3,
+                    target_bytes,
+                )),
             )
         } else {
             let hash_res = hasher.hash_file(path_ref)?;
@@ -281,7 +284,10 @@ mod tests {
             "identity changed after a content write, so it is derived from mutable \
              attributes rather than from the filesystem object"
         );
-        assert_ne!(first.sha256, second.sha256, "content hash should have changed");
+        assert_ne!(
+            first.sha256, second.sha256,
+            "content hash should have changed"
+        );
     }
 
     #[test]

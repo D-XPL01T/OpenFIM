@@ -1,7 +1,7 @@
+use sha2::{Digest, Sha256, Sha512};
 use std::fs::File;
 use std::io::Read;
 use std::path::Path;
-use sha2::{Digest, Sha256, Sha512};
 
 use crate::error::{OpenFimError, Result};
 use crate::fsident::{self, FsIdentity};
@@ -316,10 +316,8 @@ mod tests {
     const NIST_SHA512_ABC: &str = "ddaf35a193617abacc417349ae20413112e6fa4e89a97ea20a9eeee64b55d39a2192992a274fc1a836ba3c23a3feebbd454d4423643ce80e2a9ac94fa54ca49f";
     // Official BLAKE3 reference test vectors (BLAKE3-team/BLAKE3 test_vectors.json,
     // unkeyed `hash` field truncated to the default 32-byte output length).
-    const BLAKE3_EMPTY: &str =
-        "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
-    const BLAKE3_8_BYTES: &str =
-        "2351207d04fc16ade43ccab08600939c7c1fa70a5c0aaca76063d04c3228eaeb";
+    const BLAKE3_EMPTY: &str = "af1349b9f5f9a1a6a0404dea36dcc9499bcb25c9adc112b7cc9a93cae41f3262";
+    const BLAKE3_8_BYTES: &str = "2351207d04fc16ade43ccab08600939c7c1fa70a5c0aaca76063d04c3228eaeb";
 
     #[test]
     fn test_nist_sha256_vectors() {
@@ -405,7 +403,9 @@ mod tests {
     #[test]
     fn test_streaming_matches_single_shot_for_small_file() {
         let mut temp_file = NamedTempFile::new().unwrap();
-        temp_file.write_all(b"The quick brown fox jumps over the lazy dog").unwrap();
+        temp_file
+            .write_all(b"The quick brown fox jumps over the lazy dog")
+            .unwrap();
         temp_file.flush().unwrap();
 
         let mut hasher = StreamHasher::default_sha256().with_buffer_size(1024);

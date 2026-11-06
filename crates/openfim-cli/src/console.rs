@@ -109,10 +109,9 @@ struct RawModeGuard {
 
 impl RawModeGuard {
     fn new() -> Self {
-        if io::stdin().is_terminal()
-            && enable_raw_mode().is_ok() {
-                return Self { active: true };
-            }
+        if io::stdin().is_terminal() && enable_raw_mode().is_ok() {
+            return Self { active: true };
+        }
         Self { active: false }
     }
 }
@@ -365,7 +364,10 @@ fn print_banner_and_stats() {
     println!("+ -- --=[ Engine: Cryptographic Streaming Hash & TOCTOU Proof    ]");
     println!("+ -- --=[ Database: {:<45}]", db_info);
     println!("+ -- --=[ Policy:   {:<45}]", policy_info);
-    println!("+ -- --=[ Compliance: PCI DSS 11.5 | NIST 800-53 SI-7 Audit Chain  ]{}", RESET);
+    println!(
+        "+ -- --=[ Compliance: PCI DSS 11.5 | NIST 800-53 SI-7 Audit Chain  ]{}",
+        RESET
+    );
     println!();
 }
 
@@ -415,7 +417,10 @@ pub fn run_interactive_console() -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             InputResult::Exit => {
-                println!("\n{}[*] Exiting OpenFIM Console. Stay secure!{}\n", YELLOW, RESET);
+                println!(
+                    "\n{}[*] Exiting OpenFIM Console. Stay secure!{}\n",
+                    YELLOW, RESET
+                );
                 break;
             }
         };
@@ -480,40 +485,72 @@ pub fn run_interactive_console() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Operation 1: Quick File Check (with Backspace return support)
 fn op_quick_file_check() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n{}======================================================================{}", CYAN, RESET);
-    println!("{}               [1] QUICK FILE INTEGRITY INSPECTION                    {}", BOLD, RESET);
-    println!("{}======================================================================{}", CYAN, RESET);
-    println!("{}Tip: Press [Backspace] at any prompt to return to Main Menu.{}", DIM, RESET);
+    println!(
+        "\n{}======================================================================{}",
+        CYAN, RESET
+    );
+    println!(
+        "{}               [1] QUICK FILE INTEGRITY INSPECTION                    {}",
+        BOLD, RESET
+    );
+    println!(
+        "{}======================================================================{}",
+        CYAN, RESET
+    );
+    println!(
+        "{}Tip: Press [Backspace] at any prompt to return to Main Menu.{}",
+        DIM, RESET
+    );
 
     let target_str = match prompt_input("Target file to inspect", None, true)? {
         Some(s) => s,
         None => {
-            println!("{}[*] Backspace pressed. Returning to Main Menu...{}", CYAN, RESET);
+            println!(
+                "{}[*] Backspace pressed. Returning to Main Menu...{}",
+                CYAN, RESET
+            );
             return Ok(());
         }
     };
 
     if target_str.is_empty() {
-        println!("{}[-] Target file cannot be blank. Aborting inspection.{}", RED, RESET);
+        println!(
+            "{}[-] Target file cannot be blank. Aborting inspection.{}",
+            RED, RESET
+        );
         prompt_press_enter();
         return Ok(());
     }
 
     let target_path = PathBuf::from(&target_str);
-    let db_default = if Path::new("openfim.db").exists() { "openfim.db" } else { "" };
+    let db_default = if Path::new("openfim.db").exists() {
+        "openfim.db"
+    } else {
+        ""
+    };
     let db_str = match prompt_input("Baseline SQLite database", Some(db_default), true)? {
         Some(s) => s,
         None => {
-            println!("{}[*] Backspace pressed. Returning to Main Menu...{}", CYAN, RESET);
+            println!(
+                "{}[*] Backspace pressed. Returning to Main Menu...{}",
+                CYAN, RESET
+            );
             return Ok(());
         }
     };
 
-    let pol_default = if Path::new("policy.yaml").exists() { "policy.yaml" } else { "" };
+    let pol_default = if Path::new("policy.yaml").exists() {
+        "policy.yaml"
+    } else {
+        ""
+    };
     let pol_str = match prompt_input("Security policy file", Some(pol_default), true)? {
         Some(s) => s,
         None => {
-            println!("{}[*] Backspace pressed. Returning to Main Menu...{}", CYAN, RESET);
+            println!(
+                "{}[*] Backspace pressed. Returning to Main Menu...{}",
+                CYAN, RESET
+            );
             return Ok(());
         }
     };
@@ -530,7 +567,12 @@ fn op_quick_file_check() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
-    println!("\n{}--- INSPECTION REPORT FOR: {} ---{}", BOLD, target_path.display(), RESET);
+    println!(
+        "\n{}--- INSPECTION REPORT FOR: {} ---{}",
+        BOLD,
+        target_path.display(),
+        RESET
+    );
 
     let exists = target_path.exists();
     let mut hasher = StreamHasher::default_sha256();
@@ -547,7 +589,10 @@ fn op_quick_file_check() -> Result<(), Box<dyn std::error::Error>> {
         println!("File Type:           Directory");
         None
     } else {
-        println!("{}File Status:         MISSING / DELETED (Not on disk){}", RED, RESET);
+        println!(
+            "{}File Status:         MISSING / DELETED (Not on disk){}",
+            RED, RESET
+        );
         None
     };
 
@@ -555,7 +600,10 @@ fn op_quick_file_check() -> Result<(), Box<dyn std::error::Error>> {
         println!("File Status:         {}PRESENT ON DISK{}", GREEN, RESET);
         println!("File Size:           {} bytes", m.st_size);
         println!("Permissions / Mode:  {}", crate::format_mode(m.st_mode));
-        println!("Last Modified Time:  Unix timestamp {} (ctime: {})", m.st_mtime, m.st_ctime);
+        println!(
+            "Last Modified Time:  Unix timestamp {} (ctime: {})",
+            m.st_mtime, m.st_ctime
+        );
         println!("Computed SHA-256:    {}{}{}", GREEN, m.sha256, RESET);
         if let Some(ref b3) = m.blake3 {
             println!("Computed BLAKE3:     {}", b3);
@@ -576,7 +624,8 @@ fn op_quick_file_check() -> Result<(), Box<dyn std::error::Error>> {
 
                         if let Some(ref cur) = current_meta {
                             let hash_match = cur.sha256 == baseline.sha256;
-                            let meta_match = cur.st_mode == baseline.st_mode && cur.st_uid == baseline.st_uid;
+                            let meta_match =
+                                cur.st_mode == baseline.st_mode && cur.st_uid == baseline.st_uid;
 
                             if hash_match && meta_match {
                                 println!("    INTEGRITY CHECK: {}[✓] CLEAN & UNCOMPROMISED (Matches baseline snapshot){}", GREEN, RESET);
@@ -589,8 +638,16 @@ fn op_quick_file_check() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 if !meta_match {
                                     println!("      {}-> Metadata Divergence: Permissions/ownership changed!{}", RED, RESET);
-                                    println!("         Expected Mode: {}, UID: {}", crate::format_mode(baseline.st_mode), baseline.st_uid);
-                                    println!("         Current Mode:  {}, UID: {}", crate::format_mode(cur.st_mode), cur.st_uid);
+                                    println!(
+                                        "         Expected Mode: {}, UID: {}",
+                                        crate::format_mode(baseline.st_mode),
+                                        baseline.st_uid
+                                    );
+                                    println!(
+                                        "         Current Mode:  {}, UID: {}",
+                                        crate::format_mode(cur.st_mode),
+                                        cur.st_uid
+                                    );
                                 }
                             }
                         } else {
@@ -616,7 +673,10 @@ fn op_quick_file_check() -> Result<(), Box<dyn std::error::Error>> {
         match Policy::from_yaml_file(p) {
             Ok(pol) => {
                 if let Some(rule) = pol.find_matching_rule(&target_path) {
-                    println!("    Governance:      {}[✓] MONITORED BY DEFENSIVE POLICY{}", GREEN, RESET);
+                    println!(
+                        "    Governance:      {}[✓] MONITORED BY DEFENSIVE POLICY{}",
+                        GREEN, RESET
+                    );
                     println!("    Rule ID:         {}", rule.id);
                     println!("    Description:     {}", rule.description);
                     println!("    Threat Severity: {}/10", rule.severity);
@@ -641,15 +701,22 @@ fn op_quick_file_check() -> Result<(), Box<dyn std::error::Error>> {
                 if events.is_empty() {
                     println!("    Event Log:       No tampering or modification events logged for this file.");
                 } else {
-                    println!("    Recorded Events: {} recent modification event(s) found:", events.len());
+                    println!(
+                        "    Recorded Events: {} recent modification event(s) found:",
+                        events.len()
+                    );
                     for (i, ev) in events.iter().enumerate() {
                         println!("    ---------------- Event #{} ----------------", i + 1);
                         println!("      Type:          {}{}{}", RED, ev.event_type, RESET);
                         println!("      Severity:      {}/10", ev.severity);
                         println!("      Timestamp:     Unix nanos {}", ev.timestamp_nano);
                         if let Some(pid) = ev.whodata_pid {
-                            println!("      Actor Process: PID {} (Executable: {:?}, Comm: {:?})",
-                                pid, ev.whodata_exe.as_deref().unwrap_or("unknown"), ev.whodata_comm.as_deref().unwrap_or("unknown"));
+                            println!(
+                                "      Actor Process: PID {} (Executable: {:?}, Comm: {:?})",
+                                pid,
+                                ev.whodata_exe.as_deref().unwrap_or("unknown"),
+                                ev.whodata_comm.as_deref().unwrap_or("unknown")
+                            );
                         }
                         if let Some(ref cmd) = ev.whodata_cmdline {
                             println!("      Command Line:  {}", cmd);
@@ -663,7 +730,12 @@ fn op_quick_file_check() -> Result<(), Box<dyn std::error::Error>> {
                         if let Some(ref nh) = ev.new_sha256 {
                             println!("      New SHA-256:   {}", &nh[..nh.len().min(16)]);
                         }
-                        println!("      HMAC Status:   {}CHAINED (Signature: {}...){}", GREEN, &ev.hmac_signature[..ev.hmac_signature.len().min(16)], RESET);
+                        println!(
+                            "      HMAC Status:   {}CHAINED (Signature: {}...){}",
+                            GREEN,
+                            &ev.hmac_signature[..ev.hmac_signature.len().min(16)],
+                            RESET
+                        );
                     }
                 }
             }
@@ -671,7 +743,10 @@ fn op_quick_file_check() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    println!("{}======================================================================{}", CYAN, RESET);
+    println!(
+        "{}======================================================================{}",
+        CYAN, RESET
+    );
     prompt_press_enter();
     Ok(())
 }
@@ -681,15 +756,39 @@ fn op_setup_protection_menu() -> Result<(), Box<dyn std::error::Error>> {
     let mut failed_attempts = 0;
 
     loop {
-        println!("\n{}======================================================================{}", CYAN, RESET);
-        println!("{}               [2] SETUP ENDPOINT PROTECTION MENU                     {}", BOLD, RESET);
-        println!("{}======================================================================{}", CYAN, RESET);
-        println!("  {}[1]{} Generate Fresh Ed25519 Administrative Keys", GREEN, RESET);
-        println!("  {}[2]{} Create & Digitally Sign Security Policy", GREEN, RESET);
+        println!(
+            "\n{}======================================================================{}",
+            CYAN, RESET
+        );
+        println!(
+            "{}               [2] SETUP ENDPOINT PROTECTION MENU                     {}",
+            BOLD, RESET
+        );
+        println!(
+            "{}======================================================================{}",
+            CYAN, RESET
+        );
+        println!(
+            "  {}[1]{} Generate Fresh Ed25519 Administrative Keys",
+            GREEN, RESET
+        );
+        println!(
+            "  {}[2]{} Create & Digitally Sign Security Policy",
+            GREEN, RESET
+        );
         println!("  {}[3]{} Ingest Baseline Snapshot Database", GREEN, RESET);
-        println!("  {}[4]{} Export Portable Manifests (.json & .sha256)", GREEN, RESET);
-        println!("  {}[5]{} Run Complete Guided Setup Wizard (All steps)", GREEN, RESET);
-        println!("  {}[6]{} Return to Main Menu {}[or press Backspace]{}", GREEN, RESET, DIM, RESET);
+        println!(
+            "  {}[4]{} Export Portable Manifests (.json & .sha256)",
+            GREEN, RESET
+        );
+        println!(
+            "  {}[5]{} Run Complete Guided Setup Wizard (All steps)",
+            GREEN, RESET
+        );
+        println!(
+            "  {}[6]{} Return to Main Menu {}[or press Backspace]{}",
+            GREEN, RESET, DIM, RESET
+        );
         println!();
 
         let choice_res = read_input(
@@ -701,7 +800,10 @@ fn op_setup_protection_menu() -> Result<(), Box<dyn std::error::Error>> {
         let choice = match choice_res {
             InputResult::Value(v) => v,
             InputResult::GoBack => {
-                println!("{}[*] Backspace pressed. Returning to Main Menu...{}", CYAN, RESET);
+                println!(
+                    "{}[*] Backspace pressed. Returning to Main Menu...{}",
+                    CYAN, RESET
+                );
                 break;
             }
             InputResult::Exit => {
@@ -761,7 +863,10 @@ fn op_setup_protection_menu() -> Result<(), Box<dyn std::error::Error>> {
 
 /// Sub-operation: Generate Ed25519 Keys
 fn sub_generate_keys() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n{}--- GENERATE ED25519 ADMINISTRATIVE KEYS ---{}", BOLD, RESET);
+    println!(
+        "\n{}--- GENERATE ED25519 ADMINISTRATIVE KEYS ---{}",
+        BOLD, RESET
+    );
     let key_dir_str = match prompt_input("Key storage directory", Some("."), true)? {
         Some(s) => s,
         None => return Ok(()),
@@ -778,7 +883,10 @@ fn sub_generate_keys() -> Result<(), Box<dyn std::error::Error>> {
     fs::write(&pub_path, &pub_hex)?;
     fs::write(&priv_path, &priv_hex)?;
 
-    println!("{}[+] Generated fresh Ed25519 administrative keys:{}", GREEN, RESET);
+    println!(
+        "{}[+] Generated fresh Ed25519 administrative keys:{}",
+        GREEN, RESET
+    );
     println!("    Public Key:  {}", pub_path.display());
     println!("    Private Key: {}", priv_path.display());
     prompt_press_enter();
@@ -816,7 +924,11 @@ fn sub_create_policy() -> Result<(), Box<dyn std::error::Error>> {
         _ => "restore_baseline",
     };
 
-    let priv_key_str = match prompt_input("Admin private key (hex or path to .key)", Some("openfim_admin.key"), true)? {
+    let priv_key_str = match prompt_input(
+        "Admin private key (hex or path to .key)",
+        Some("openfim_admin.key"),
+        true,
+    )? {
         Some(s) => s,
         None => return Ok(()),
     };
@@ -870,7 +982,12 @@ rules:
     let sig_path = PathBuf::from(format!("{}.sig", pol_path.display()));
     fs::write(&sig_path, sig_hex)?;
 
-    println!("{}[+] Policy written and signed successfully: {}{}", GREEN, pol_path.display(), RESET);
+    println!(
+        "{}[+] Policy written and signed successfully: {}{}",
+        GREEN,
+        pol_path.display(),
+        RESET
+    );
     println!("{}[+] Signature: {}{}", GREEN, sig_path.display(), RESET);
     prompt_press_enter();
     Ok(())
@@ -878,12 +995,16 @@ rules:
 
 /// Sub-operation: Capture Baseline Snapshot
 fn sub_baseline_snapshot() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n{}--- INGEST BASELINE SNAPSHOT DATABASE ---{}", BOLD, RESET);
+    println!(
+        "\n{}--- INGEST BASELINE SNAPSHOT DATABASE ---{}",
+        BOLD, RESET
+    );
     let target_dir_str = match prompt_input("Directory root to crawl", Some("."), true)? {
         Some(s) => s,
         None => return Ok(()),
     };
-    let db_out_str = match prompt_input("Baseline SQLite database path", Some("openfim.db"), true)? {
+    let db_out_str = match prompt_input("Baseline SQLite database path", Some("openfim.db"), true)?
+    {
         Some(s) => s,
         None => return Ok(()),
     };
@@ -892,20 +1013,34 @@ fn sub_baseline_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let db_path = PathBuf::from(db_out_str);
     let mut baseline_db = BaselineDb::open(&db_path)?;
 
-    println!("{}[*] Crawling target directory '{}' and computing SHA-256 hashes...{}", CYAN, target_dir.display(), RESET);
+    println!(
+        "{}[*] Crawling target directory '{}' and computing SHA-256 hashes...{}",
+        CYAN,
+        target_dir.display(),
+        RESET
+    );
     let crawler = FileCrawler::new(CrawlOptions::default());
     let mut hasher = StreamHasher::default_sha256();
     let snapshot = crawler.crawl(&target_dir, &mut hasher)?;
 
     let count = baseline_db.insert_batch(&snapshot, "v1.0")?;
-    println!("{}[+] Indexed {} files into baseline database: {}{}", GREEN, count, db_path.display(), RESET);
+    println!(
+        "{}[+] Indexed {} files into baseline database: {}{}",
+        GREEN,
+        count,
+        db_path.display(),
+        RESET
+    );
     prompt_press_enter();
     Ok(())
 }
 
 /// Sub-operation: Export Portable Manifests
 fn sub_export_manifests() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n{}--- EXPORT PORTABLE MANIFESTS FOR WEB GUI ---{}", BOLD, RESET);
+    println!(
+        "\n{}--- EXPORT PORTABLE MANIFESTS FOR WEB GUI ---{}",
+        BOLD, RESET
+    );
     let db_str = match prompt_input("Baseline SQLite database", Some("openfim.db"), true)? {
         Some(s) => s,
         None => return Ok(()),
@@ -917,17 +1052,32 @@ fn sub_export_manifests() -> Result<(), Box<dyn std::error::Error>> {
     fs::write("manifest.json", json_manifest)?;
     fs::write("manifest.sha256", sha_manifest)?;
 
-    println!("{}[+] Exported 'manifest.json' and 'manifest.sha256' for web/verifier.html{}", GREEN, RESET);
+    println!(
+        "{}[+] Exported 'manifest.json' and 'manifest.sha256' for web/verifier.html{}",
+        GREEN, RESET
+    );
     prompt_press_enter();
     Ok(())
 }
 
 /// Complete Guided Setup Wizard
 fn op_setup_protection_wizard() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n{}======================================================================{}", CYAN, RESET);
-    println!("{}               COMPLETE GUIDED SETUP WIZARD                           {}", BOLD, RESET);
-    println!("{}======================================================================{}", CYAN, RESET);
-    println!("{}Tip: Press [Backspace] at any prompt to return to previous menu.{}", DIM, RESET);
+    println!(
+        "\n{}======================================================================{}",
+        CYAN, RESET
+    );
+    println!(
+        "{}               COMPLETE GUIDED SETUP WIZARD                           {}",
+        BOLD, RESET
+    );
+    println!(
+        "{}======================================================================{}",
+        CYAN, RESET
+    );
+    println!(
+        "{}Tip: Press [Backspace] at any prompt to return to previous menu.{}",
+        DIM, RESET
+    );
 
     // 1. Target Directory
     let target_dir_str = match prompt_input("Target directory root to protect", Some("."), true)? {
@@ -936,12 +1086,21 @@ fn op_setup_protection_wizard() -> Result<(), Box<dyn std::error::Error>> {
     };
     let target_dir = PathBuf::from(&target_dir_str);
     if !target_dir.exists() {
-        println!("{}[-] Directory '{}' does not exist. Creating it now...{}", YELLOW, target_dir.display(), RESET);
+        println!(
+            "{}[-] Directory '{}' does not exist. Creating it now...{}",
+            YELLOW,
+            target_dir.display(),
+            RESET
+        );
         fs::create_dir_all(&target_dir)?;
     }
 
     // 2. Administrative Keys
-    let gen_keys = match prompt_confirm("Generate fresh Ed25519 administrative security keypair?", true, true)? {
+    let gen_keys = match prompt_confirm(
+        "Generate fresh Ed25519 administrative security keypair?",
+        true,
+        true,
+    )? {
         Some(b) => b,
         None => return Ok(()),
     };
@@ -963,16 +1122,27 @@ fn op_setup_protection_wizard() -> Result<(), Box<dyn std::error::Error>> {
         fs::write(&pub_path, &pub_hex)?;
         fs::write(&priv_path, &priv_hex)?;
 
-        println!("{}[+] Generated and saved fresh Ed25519 keys:{}", GREEN, RESET);
+        println!(
+            "{}[+] Generated and saved fresh Ed25519 keys:{}",
+            GREEN, RESET
+        );
         println!("    Public Key:  {}", pub_path.display());
         println!("    Private Key: {}", priv_path.display());
         (pub_path, priv_hex)
     } else {
-        let pub_str = match prompt_input("Path to existing public key (openfim_admin.pub)", Some("openfim_admin.pub"), true)? {
+        let pub_str = match prompt_input(
+            "Path to existing public key (openfim_admin.pub)",
+            Some("openfim_admin.pub"),
+            true,
+        )? {
             Some(s) => s,
             None => return Ok(()),
         };
-        let priv_str = match prompt_input("Existing private key (hex or path to .key)", Some("openfim_admin.key"), true)? {
+        let priv_str = match prompt_input(
+            "Existing private key (hex or path to .key)",
+            Some("openfim_admin.key"),
+            true,
+        )? {
             Some(s) => s,
             None => return Ok(()),
         };
@@ -985,10 +1155,11 @@ fn op_setup_protection_wizard() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     // 3. Declarative Policy
-    let create_policy = match prompt_confirm("Create and sign security policy manifest?", true, true)? {
-        Some(b) => b,
-        None => return Ok(()),
-    };
+    let create_policy =
+        match prompt_confirm("Create and sign security policy manifest?", true, true)? {
+            Some(b) => b,
+            None => return Ok(()),
+        };
 
     let policy_path = if create_policy {
         let pol_out_str = match prompt_input("Policy output filename", Some("policy.yaml"), true)? {
@@ -1063,33 +1234,57 @@ rules:
             let pub_hex = fs::read_to_string(&pub_file)?;
             let vk = PolicySigner::pubkey_from_hex(&pub_hex)?;
             PolicyVerifier::verify_file(&pol_path, &sig_path, &vk)?;
-            println!("{}[✓] Cryptographic Ed25519 Signature Verified: VALID & AUTHENTIC{}", GREEN, RESET);
+            println!(
+                "{}[✓] Cryptographic Ed25519 Signature Verified: VALID & AUTHENTIC{}",
+                GREEN, RESET
+            );
         }
 
-        println!("{}[+] Created and digitally signed policy: {}{}", GREEN, pol_path.display(), RESET);
+        println!(
+            "{}[+] Created and digitally signed policy: {}{}",
+            GREEN,
+            pol_path.display(),
+            RESET
+        );
         pol_path
     } else {
         PathBuf::from("policy.yaml")
     };
 
     // 4. Baseline Snapshot
-    let db_out_str = match prompt_input("Baseline SQLite database path", Some("openfim.db"), true)? {
+    let db_out_str = match prompt_input("Baseline SQLite database path", Some("openfim.db"), true)?
+    {
         Some(s) => s,
         None => return Ok(()),
     };
     let db_path = PathBuf::from(db_out_str);
     let mut baseline_db = BaselineDb::open(&db_path)?;
 
-    println!("{}[*] Crawling target directory '{}' and computing SHA-256 hashes...{}", CYAN, target_dir.display(), RESET);
+    println!(
+        "{}[*] Crawling target directory '{}' and computing SHA-256 hashes...{}",
+        CYAN,
+        target_dir.display(),
+        RESET
+    );
     let crawler = FileCrawler::new(CrawlOptions::default());
     let mut hasher = StreamHasher::default_sha256();
     let snapshot = crawler.crawl(&target_dir, &mut hasher)?;
 
     let count = baseline_db.insert_batch(&snapshot, "v1.0")?;
-    println!("{}[+] Successfully indexed {} files into baseline database: {}{}", GREEN, count, db_path.display(), RESET);
+    println!(
+        "{}[+] Successfully indexed {} files into baseline database: {}{}",
+        GREEN,
+        count,
+        db_path.display(),
+        RESET
+    );
 
     // 5. Portable Manifests for Web GUI
-    let export_web = match prompt_confirm("Export portable manifests for Zero-Upload Web GUI?", true, true)? {
+    let export_web = match prompt_confirm(
+        "Export portable manifests for Zero-Upload Web GUI?",
+        true,
+        true,
+    )? {
         Some(b) => b,
         None => return Ok(()),
     };
@@ -1098,18 +1293,33 @@ rules:
         let sha_manifest = baseline_db.export_manifest("sha256")?;
         fs::write("manifest.json", json_manifest)?;
         fs::write("manifest.sha256", sha_manifest)?;
-        println!("{}[+] Exported 'manifest.json' and 'manifest.sha256' for web/verifier.html{}", GREEN, RESET);
+        println!(
+            "{}[+] Exported 'manifest.json' and 'manifest.sha256' for web/verifier.html{}",
+            GREEN, RESET
+        );
     }
 
-    println!("\n{}======================================================================{}", GREEN, RESET);
-    println!("{}                 [✓] SETUP PROTECTION COMPLETED                      {}", BOLD, RESET);
-    println!("{}======================================================================{}", GREEN, RESET);
+    println!(
+        "\n{}======================================================================{}",
+        GREEN, RESET
+    );
+    println!(
+        "{}                 [✓] SETUP PROTECTION COMPLETED                      {}",
+        BOLD, RESET
+    );
+    println!(
+        "{}======================================================================{}",
+        GREEN, RESET
+    );
     println!("Summary:");
     println!("  Target Root:   {}", target_dir.display());
     println!("  Policy:        {} (Signed)", policy_path.display());
     println!("  Baseline DB:   {} ({} records)", db_path.display(), count);
     println!("  Web Verifier:  Ready (Open web/verifier.html in browser)");
-    println!("{}======================================================================{}", GREEN, RESET);
+    println!(
+        "{}======================================================================{}",
+        GREEN, RESET
+    );
 
     prompt_press_enter();
     Ok(())
@@ -1117,10 +1327,22 @@ rules:
 
 /// Operation 3: Monitor & Remediate (with Backspace return support)
 fn op_monitor_and_remediate() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n{}======================================================================{}", CYAN, RESET);
-    println!("{}            [3] REAL-TIME SENSOR & REMEDIATION DAEMON                 {}", BOLD, RESET);
-    println!("{}======================================================================{}", CYAN, RESET);
-    println!("{}Tip: Press [Backspace] at any prompt to return to Main Menu.{}", DIM, RESET);
+    println!(
+        "\n{}======================================================================{}",
+        CYAN, RESET
+    );
+    println!(
+        "{}            [3] REAL-TIME SENSOR & REMEDIATION DAEMON                 {}",
+        BOLD, RESET
+    );
+    println!(
+        "{}======================================================================{}",
+        CYAN, RESET
+    );
+    println!(
+        "{}Tip: Press [Backspace] at any prompt to return to Main Menu.{}",
+        DIM, RESET
+    );
 
     let pol_str = match prompt_input("Security policy file", Some("policy.yaml"), true)? {
         Some(s) => s,
@@ -1130,17 +1352,29 @@ fn op_monitor_and_remediate() -> Result<(), Box<dyn std::error::Error>> {
         Some(s) => s,
         None => return Ok(()),
     };
-    let pub_str = match prompt_input("Admin public key for policy verification", Some("openfim_admin.pub"), true)? {
+    let pub_str = match prompt_input(
+        "Admin public key for policy verification",
+        Some("openfim_admin.pub"),
+        true,
+    )? {
         Some(s) => s,
         None => return Ok(()),
     };
-    let rem = match prompt_confirm("Enable Automated Active Remediation (quarantine/rollback)?", true, true)? {
+    let rem = match prompt_confirm(
+        "Enable Automated Active Remediation (quarantine/rollback)?",
+        true,
+        true,
+    )? {
         Some(b) => b,
         None => return Ok(()),
     };
 
     let backup_dir_str = if rem {
-        match prompt_input("Backup directory for baseline rollback", Some("backups"), true)? {
+        match prompt_input(
+            "Backup directory for baseline rollback",
+            Some("backups"),
+            true,
+        )? {
             Some(s) => s,
             None => return Ok(()),
         }
@@ -1166,8 +1400,16 @@ fn op_monitor_and_remediate() -> Result<(), Box<dyn std::error::Error>> {
     let agent_bin = candidate_paths.into_iter().find(|p| p.exists());
 
     if let Some(agent_path) = agent_bin {
-        println!("{}[*] Launching Real-Time Sensor Daemon: {}{}", GREEN, agent_path.display(), RESET);
-        println!("{}[*] Press [Ctrl+C] at any time to stop monitoring and return to console.{}\n", YELLOW, RESET);
+        println!(
+            "{}[*] Launching Real-Time Sensor Daemon: {}{}",
+            GREEN,
+            agent_path.display(),
+            RESET
+        );
+        println!(
+            "{}[*] Press [Ctrl+C] at any time to stop monitoring and return to console.{}\n",
+            YELLOW, RESET
+        );
 
         let mut cmd = std::process::Command::new(agent_path);
         cmd.arg("--config").arg(&pol_str);
@@ -1184,10 +1426,21 @@ fn op_monitor_and_remediate() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         let _ = cmd.status();
-        println!("\n{}[*] Sensor daemon exited. Returning to OpenFIM console.{}", CYAN, RESET);
+        println!(
+            "\n{}[*] Sensor daemon exited. Returning to OpenFIM console.{}",
+            CYAN, RESET
+        );
     } else {
-        println!("{}[!] 'openfim-agent' binary not found. Running in-process real-time sensor...{}", YELLOW, RESET);
-        run_inprocess_sensor(&pol_str, &db_str, rem, if rem { Some(&backup_dir_str) } else { None })?;
+        println!(
+            "{}[!] 'openfim-agent' binary not found. Running in-process real-time sensor...{}",
+            YELLOW, RESET
+        );
+        run_inprocess_sensor(
+            &pol_str,
+            &db_str,
+            rem,
+            if rem { Some(&backup_dir_str) } else { None },
+        )?;
     }
 
     prompt_press_enter();
@@ -1206,15 +1459,27 @@ fn run_inprocess_sensor(
     use std::time::Duration;
 
     if !Path::new(pol_file).exists() {
-        println!("{}[!] Policy file '{}' does not exist.{}", RED, pol_file, RESET);
+        println!(
+            "{}[!] Policy file '{}' does not exist.{}",
+            RED, pol_file, RESET
+        );
         return Ok(());
     }
 
     let policy = Policy::from_yaml_file(pol_file)?;
     let db = BaselineDb::open(db_file)?;
 
-    println!("{}[*] Loaded policy '{}' with {} rules.{}", GREEN, policy.policy_id, policy.rules.len(), RESET);
-    println!("{}[*] SQLite baseline active at '{}'.{}", GREEN, db_file, RESET);
+    println!(
+        "{}[*] Loaded policy '{}' with {} rules.{}",
+        GREEN,
+        policy.policy_id,
+        policy.rules.len(),
+        RESET
+    );
+    println!(
+        "{}[*] SQLite baseline active at '{}'.{}",
+        GREEN, db_file, RESET
+    );
 
     let (tx, rx) = mpsc::channel();
     let mut watcher = RecommendedWatcher::new(
@@ -1235,8 +1500,14 @@ fn run_inprocess_sensor(
         }
     }
 
-    println!("{}[*] Real-time sensor active. Watching filesystem...{}", CYAN, RESET);
-    println!("{}[*] Press Enter or Ctrl+C to stop monitoring.{}", YELLOW, RESET);
+    println!(
+        "{}[*] Real-time sensor active. Watching filesystem...{}",
+        CYAN, RESET
+    );
+    println!(
+        "{}[*] Press Enter or Ctrl+C to stop monitoring.{}",
+        YELLOW, RESET
+    );
 
     // No built-in key: a shared constant would let anyone with the binary forge the
     // audit chain, and would also silently disagree with the key the agent daemon
@@ -1277,7 +1548,10 @@ fn run_inprocess_sensor(
 
     while started.elapsed() < session_limit {
         if let Ok(event) = rx.recv_timeout(Duration::from_millis(150)) {
-            if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
+            if !matches!(
+                event.kind,
+                EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
+            ) {
                 continue;
             }
 
@@ -1302,11 +1576,17 @@ fn run_inprocess_sensor(
                     .as_nanos() as i64;
 
                 if path.exists() && path.is_file() {
-                    let mut hasher = StreamHasher::new(HashAlgorithm::Sha256, TokenBucket::new(rate_bytes));
+                    let mut hasher =
+                        StreamHasher::new(HashAlgorithm::Sha256, TokenBucket::new(rate_bytes));
                     if let Ok(cur_meta) = FileMetadata::extract(&path, &mut hasher) {
                         if let Ok(Some(base_meta)) = db.get_entry(&path) {
                             if base_meta.sha256 != cur_meta.sha256 {
-                                println!("\n{}[!] CRITICAL INTEGRITY ALERT: CONTENT_MUTATED on {}{}", RED, path.display(), RESET);
+                                println!(
+                                    "\n{}[!] CRITICAL INTEGRITY ALERT: CONTENT_MUTATED on {}{}",
+                                    RED,
+                                    path.display(),
+                                    RESET
+                                );
                                 println!("    Old Hash: {}", base_meta.sha256);
                                 println!("    New Hash: {}", cur_meta.sha256);
                                 if whodata.is_attributed {
@@ -1334,8 +1614,16 @@ fn run_inprocess_sensor(
                                     // itself as the process that made the change.
                                     whodata_pid: attributed.then_some(whodata.pid),
                                     whodata_uid: if attributed { whodata.uid } else { None },
-                                    whodata_comm: if attributed { whodata.comm.clone() } else { None },
-                                    whodata_exe: if attributed { whodata.exe.clone() } else { None },
+                                    whodata_comm: if attributed {
+                                        whodata.comm.clone()
+                                    } else {
+                                        None
+                                    },
+                                    whodata_exe: if attributed {
+                                        whodata.exe.clone()
+                                    } else {
+                                        None
+                                    },
                                     whodata_cmdline: if attributed {
                                         whodata.cmdline.clone()
                                     } else {
@@ -1348,8 +1636,7 @@ fn run_inprocess_sensor(
                                     hmac_signature: String::new(),
                                     sent_to_manager: false,
                                 };
-                                if let Err(e) =
-                                    db.append_spool_event_chained(&mut spool, &hmac_key)
+                                if let Err(e) = db.append_spool_event_chained(&mut spool, &hmac_key)
                                 {
                                     println!(
                                         "    {}[!] Failed to record this event to the audit chain: {}{}",
@@ -1359,11 +1646,8 @@ fn run_inprocess_sensor(
 
                                 if remediation {
                                     let b_path = backup_dir.map(Path::new);
-                                    match guard.execute(
-                                        rule.active_response.action,
-                                        &path,
-                                        b_path,
-                                    ) {
+                                    match guard.execute(rule.active_response.action, &path, b_path)
+                                    {
                                         Ok(outcome) => println!(
                                             "    {}[REMEDIATION] {}{}",
                                             GREEN, outcome, RESET
@@ -1399,7 +1683,11 @@ fn resolve_console_audit_key() -> Result<Option<Vec<u8>>, Box<dyn std::error::Er
         }
     }
 
-    match prompt_input("HMAC secret key (no default; or set OPENFIM_HMAC_KEY)", None, true)? {
+    match prompt_input(
+        "HMAC secret key (no default; or set OPENFIM_HMAC_KEY)",
+        None,
+        true,
+    )? {
         Some(s) if !s.trim().is_empty() => Ok(Some(s.trim().as_bytes().to_vec())),
         _ => Ok(None),
     }
@@ -1407,12 +1695,28 @@ fn resolve_console_audit_key() -> Result<Option<Vec<u8>>, Box<dyn std::error::Er
 
 /// Operation 4: Forensics & Audit Log (with Backspace return support)
 fn op_forensics_and_audit() -> Result<(), Box<dyn std::error::Error>> {
-    println!("\n{}======================================================================{}", CYAN, RESET);
-    println!("{}            [4] FORENSIC AUDIT & TAMPER-EVIDENT SPOOL                 {}", BOLD, RESET);
-    println!("{}======================================================================{}", CYAN, RESET);
-    println!("{}Tip: Press [Backspace] at any prompt to return to Main Menu.{}", DIM, RESET);
+    println!(
+        "\n{}======================================================================{}",
+        CYAN, RESET
+    );
+    println!(
+        "{}            [4] FORENSIC AUDIT & TAMPER-EVIDENT SPOOL                 {}",
+        BOLD, RESET
+    );
+    println!(
+        "{}======================================================================{}",
+        CYAN, RESET
+    );
+    println!(
+        "{}Tip: Press [Backspace] at any prompt to return to Main Menu.{}",
+        DIM, RESET
+    );
 
-    let db_str = match prompt_input("Baseline SQLite database to audit", Some("openfim.db"), true)? {
+    let db_str = match prompt_input(
+        "Baseline SQLite database to audit",
+        Some("openfim.db"),
+        true,
+    )? {
         Some(s) => s,
         None => return Ok(()),
     };
@@ -1440,23 +1744,44 @@ fn op_forensics_and_audit() -> Result<(), Box<dyn std::error::Error>> {
 
     let db = BaselineDb::open(db_path)?;
 
-    println!("{}[*] Cryptographically auditing HMAC chain and sequence continuity...{}", CYAN, RESET);
+    println!(
+        "{}[*] Cryptographically auditing HMAC chain and sequence continuity...{}",
+        CYAN, RESET
+    );
     let report = db.verify_spool_chain(&key_str)?;
 
     if report.is_valid {
-        println!("\n{}============================================================", GREEN);
+        println!(
+            "\n{}============================================================",
+            GREEN
+        );
         println!("  [✓] AUDIT PASSED: Tamper-Evident HMAC Chain is VALID      ");
         println!("  Total Events Verified:  {}", report.total_events);
         println!("  Sequence Continuity:    CONTIGUOUS (No gaps/deletions)    ");
         println!("  Cryptographic Status:   UNCOMPROMISED                     ");
-        println!("============================================================{}", RESET);
+        println!(
+            "============================================================{}",
+            RESET
+        );
     } else {
-        println!("\n{}============================================================", RED);
+        println!(
+            "\n{}============================================================",
+            RED
+        );
         println!("  [✗] AUDIT FAILED: TAMPERING DETECTED!                     ");
         println!("  Total Events Verified:  {}", report.total_events);
-        println!("  Tampered Sequence ID:   {:?}", report.tampered_sequence_id);
-        println!("  Error Details:          {}", report.error_message.unwrap_or_default());
-        println!("============================================================{}", RESET);
+        println!(
+            "  Tampered Sequence ID:   {:?}",
+            report.tampered_sequence_id
+        );
+        println!(
+            "  Error Details:          {}",
+            report.error_message.unwrap_or_default()
+        );
+        println!(
+            "============================================================{}",
+            RESET
+        );
     }
 
     // Retrieve recent logged security events from the spool
@@ -1471,7 +1796,12 @@ fn op_forensics_and_audit() -> Result<(), Box<dyn std::error::Error>> {
             let short_sig = &ev.hmac_signature[..ev.hmac_signature.len().min(12)];
             println!(
                 "  [{:2}] Seq #{:<3} | {:<16} | Path: {:<25} | Actor: {:<12} | HMAC: {}",
-                i + 1, seq, ev.event_type, ev.path, p_name, short_sig
+                i + 1,
+                seq,
+                ev.event_type,
+                ev.path,
+                p_name,
+                short_sig
             );
         }
     }

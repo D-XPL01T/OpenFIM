@@ -1,9 +1,9 @@
-use std::fs;
-use std::path::{Path, PathBuf};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use glob::Pattern;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::{Path, PathBuf};
 
 use crate::error::{OpenFimError, Result};
 
@@ -18,7 +18,6 @@ pub enum RuleMode {
     OnBoot,
 }
 
-
 /// Active automated response action when an integrity violation is detected
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -30,7 +29,6 @@ pub enum ActiveResponseAction {
     KillProcess,
     Quarantine,
 }
-
 
 /// Outcome of an attempted automated remediation.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -232,7 +230,9 @@ impl ActiveResponseAction {
                 // never observed truncated or half-written by the live workload.
                 let tmp = p.with_extension(format!(
                     "{}.openfim-restore",
-                    p.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default()
+                    p.extension()
+                        .map(|e| e.to_string_lossy().to_string())
+                        .unwrap_or_default()
                 ));
                 std::fs::copy(&backup_file, &tmp)?;
                 match std::fs::rename(&tmp, p) {
@@ -562,8 +562,7 @@ impl CompiledPolicy {
                         let absolute = if Path::new(target).is_absolute() {
                             None
                         } else {
-                            cwd.as_ref()
-                                .map(|cd| normalize_path(&cd.join(target)))
+                            cwd.as_ref().map(|cd| normalize_path(&cd.join(target)))
                         };
                         let absolute_with_slash = absolute
                             .as_ref()
@@ -605,13 +604,8 @@ impl CompiledPolicy {
 
     /// Evaluates which rule applies to a path, honouring specificity precedence.
     pub fn find_matching_rule(&self, path: &Path) -> Option<&PolicyRule> {
-        Self::best_match_in(
-            &self.rules,
-            &self.policy.rules,
-            self.cwd.as_deref(),
-            path,
-        )
-        .map(|idx| &self.policy.rules[idx])
+        Self::best_match_in(&self.rules, &self.policy.rules, self.cwd.as_deref(), path)
+            .map(|idx| &self.policy.rules[idx])
     }
 
     /// True when the path is covered by any rule and not ignored.
@@ -633,11 +627,7 @@ impl CompiledPolicy {
         let norm_path = normalize_path(path);
         let clean_path = norm_path.trim_start_matches("./");
 
-        let rel_to_cwd = cwd.and_then(|cd| {
-            path.strip_prefix(cd)
-                .ok()
-                .map(normalize_path)
-        });
+        let rel_to_cwd = cwd.and_then(|cd| path.strip_prefix(cd).ok().map(normalize_path));
 
         let mut best: Option<(usize, usize, u32)> = None; // (rule index, specificity, severity)
 
@@ -690,9 +680,8 @@ impl CompiledPolicy {
 
                 if exact || prefix || globbed {
                     rule_specificity = Some(
-                        rule_specificity.map_or(target.specificity, |s: usize| {
-                            s.max(target.specificity)
-                        }),
+                        rule_specificity
+                            .map_or(target.specificity, |s: usize| s.max(target.specificity)),
                     );
                 }
             }
@@ -734,7 +723,10 @@ impl PolicySigner {
     }
 
     /// Signs a policy file on disk and returns the raw signature
-    pub fn sign_file<P: AsRef<Path>>(policy_path: P, signing_key: &SigningKey) -> Result<Signature> {
+    pub fn sign_file<P: AsRef<Path>>(
+        policy_path: P,
+        signing_key: &SigningKey,
+    ) -> Result<Signature> {
         let data = fs::read(policy_path.as_ref()).map_err(|e| OpenFimError::IoError {
             path: policy_path.as_ref().to_path_buf(),
             source: e,
@@ -759,8 +751,7 @@ impl PolicySigner {
         }
         let mut arr = [0u8; 32];
         arr.copy_from_slice(&bytes);
-        VerifyingKey::from_bytes(&arr)
-            .map_err(|e| OpenFimError::InvalidKeyFormat(e.to_string()))
+        VerifyingKey::from_bytes(&arr).map_err(|e| OpenFimError::InvalidKeyFormat(e.to_string()))
     }
 
     /// Converts a SigningKey (private key) to a 64-character lowercase hex string
@@ -853,9 +844,9 @@ impl PolicyVerifier {
         verifying_key: &VerifyingKey,
     ) -> Result<Policy> {
         let mut sig_path = policy_path.as_ref().to_path_buf();
-        let ext = sig_path
-            .extension()
-            .map_or("sig".to_string(), |e| format!("{}.sig", e.to_string_lossy()));
+        let ext = sig_path.extension().map_or("sig".to_string(), |e| {
+            format!("{}.sig", e.to_string_lossy())
+        });
         sig_path.set_extension(ext);
 
         Self::verify_file(policy_path, sig_path, verifying_key)
@@ -954,7 +945,8 @@ rules:
 
     #[test]
     fn test_parse_enterprise_policy_yaml() {
-        let policy = Policy::from_yaml_str(SAMPLE_ENTERPRISE_POLICY).expect("Failed to parse policy YAML");
+        let policy =
+            Policy::from_yaml_str(SAMPLE_ENTERPRISE_POLICY).expect("Failed to parse policy YAML");
 
         assert_eq!(policy.version, "1.0");
         assert_eq!(policy.policy_id, "pol-linux-enterprise-server-v1");
@@ -982,7 +974,10 @@ rules:
         let r3 = &policy.rules[2];
         assert_eq!(r3.id, "SSH_AUTHORIZED_KEYS");
         assert!(!r3.nodiff);
-        assert_eq!(r3.active_response.action, ActiveResponseAction::RestoreBaseline);
+        assert_eq!(
+            r3.active_response.action,
+            ActiveResponseAction::RestoreBaseline
+        );
     }
 
     #[test]
@@ -1028,19 +1023,25 @@ rules:
         let policy = Policy::from_yaml_str(SAMPLE_ENTERPRISE_POLICY).expect("Parse error");
 
         // 1. /etc/shadow should match ETC_AUTH_CRITICAL
-        let r_shadow = policy.find_matching_rule(Path::new("/etc/shadow")).expect("Should match");
+        let r_shadow = policy
+            .find_matching_rule(Path::new("/etc/shadow"))
+            .expect("Should match");
         assert_eq!(r_shadow.id, "ETC_AUTH_CRITICAL");
         assert!(r_shadow.nodiff);
 
         // 2. /usr/bin/curl should match SYSTEM_BINARIES_IMMUTABLE
-        let r_bin = policy.find_matching_rule(Path::new("/usr/bin/curl")).expect("Should match");
+        let r_bin = policy
+            .find_matching_rule(Path::new("/usr/bin/curl"))
+            .expect("Should match");
         assert_eq!(r_bin.id, "SYSTEM_BINARIES_IMMUTABLE");
 
         // 3. /usr/lib/locale/en_US should be IGNORED by SYSTEM_BINARIES_IMMUTABLE
         assert!(!policy.is_monitored(Path::new("/usr/lib/locale/en_US/LC_MESSAGES")));
 
         // 4. /root/.ssh/authorized_keys should match SSH_AUTHORIZED_KEYS
-        let r_ssh = policy.find_matching_rule(Path::new("/root/.ssh/authorized_keys")).expect("Should match");
+        let r_ssh = policy
+            .find_matching_rule(Path::new("/root/.ssh/authorized_keys"))
+            .expect("Should match");
         assert_eq!(r_ssh.id, "SSH_AUTHORIZED_KEYS");
 
         // 5. /root/.ssh/known_hosts should be IGNORED
@@ -1253,7 +1254,10 @@ rules:
             .unwrap();
 
         assert!(outcome.was_applied(), "{}", outcome.message());
-        assert!(!target.exists(), "quarantined file should no longer be at its path");
+        assert!(
+            !target.exists(),
+            "quarantined file should no longer be at its path"
+        );
         assert!(dir.path().join(".quarantine").is_dir());
     }
 
@@ -1283,7 +1287,11 @@ rules:
             let target = dir.path().join("f.conf");
             std::fs::write(&target, b"bad").unwrap();
             let outcome = guard
-                .execute(ActiveResponseAction::RestoreBaseline, &target, Some(&backups))
+                .execute(
+                    ActiveResponseAction::RestoreBaseline,
+                    &target,
+                    Some(&backups),
+                )
                 .unwrap();
             if outcome.was_applied() {
                 applied += 1;
@@ -1292,17 +1300,22 @@ rules:
             }
         }
 
-        assert_eq!(applied, 3, "circuit breaker did not cap remediations at the limit");
+        assert_eq!(
+            applied, 3,
+            "circuit breaker did not cap remediations at the limit"
+        );
         assert_eq!(declined, 3);
         assert_eq!(guard.remaining(), 0);
     }
 
     #[test]
     fn test_remediation_guard_window_expiry_restores_budget() {
-        let mut guard =
-            RemediationGuard::with_window(1, std::time::Duration::from_millis(80));
+        let mut guard = RemediationGuard::with_window(1, std::time::Duration::from_millis(80));
         assert!(guard.try_consume());
-        assert!(!guard.try_consume(), "second attempt inside the window must be refused");
+        assert!(
+            !guard.try_consume(),
+            "second attempt inside the window must be refused"
+        );
         std::thread::sleep(std::time::Duration::from_millis(120));
         assert!(
             guard.try_consume(),
