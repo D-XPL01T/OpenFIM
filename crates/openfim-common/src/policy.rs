@@ -10,45 +10,184 @@ use crate::error::{OpenFimError, Result};
 /// Execution mode for a monitoring rule
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum RuleMode {
+    #[default]
     Realtime,
     Scheduled,
     OnBoot,
 }
 
-impl Default for RuleMode {
-    fn default() -> Self {
-        Self::Realtime
-    }
-}
 
 /// Active automated response action when an integrity violation is detected
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[derive(Default)]
 pub enum ActiveResponseAction {
+    #[default]
     None,
     RestoreBaseline,
     KillProcess,
     Quarantine,
 }
 
-impl Default for ActiveResponseAction {
+
+/// Outcome of an attempted automated remediation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemediationOutcome {
+    /// No action was configured for this rule.
+    NotConfigured,
+    /// The action ran and changed the system. The string describes what happened.
+    Applied(String),
+    /// The action was deliberately not taken. The string explains why.
+    Declined(String),
+}
+
+impl RemediationOutcome {
+    /// True when the action actually modified the system.
+    pub fn was_applied(&self) -> bool {
+        matches!(self, RemediationOutcome::Applied(_))
+    }
+
+    /// Human-readable description of the outcome.
+    pub fn message(&self) -> &str {
+        match self {
+            RemediationOutcome::NotConfigured => "No remediation configured",
+            RemediationOutcome::Applied(m) | RemediationOutcome::Declined(m) => m,
+        }
+    }
+}
+
+impl std::fmt::Display for RemediationOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            RemediationOutcome::NotConfigured => write!(f, "not configured"),
+            RemediationOutcome::Applied(m) => write!(f, "applied: {}", m),
+            RemediationOutcome::Declined(m) => write!(f, "declined: {}", m),
+        }
+    }
+}
+
+/// Default ceiling on automated remediations per rolling hour.
+///
+/// The threat model's own risk register (RSK-04) requires this: an attacker who can
+/// repeatedly touch a monitored file would otherwise drive an unbounded loop of
+/// quarantines or rollbacks, turning the defensive response into a denial of service
+/// against the very data it protects.
+pub const DEFAULT_MAX_REMEDIATIONS_PER_HOUR: u32 = 3;
+
+/// Rate limiter and audit counter guarding automated active response.
+#[derive(Debug, Clone)]
+pub struct RemediationGuard {
+    max_per_hour: u32,
+    window: std::time::Duration,
+    recent: std::collections::VecDeque<std::time::Instant>,
+}
+
+impl Default for RemediationGuard {
     fn default() -> Self {
-        Self::None
+        Self::new(DEFAULT_MAX_REMEDIATIONS_PER_HOUR)
+    }
+}
+
+impl RemediationGuard {
+    /// Creates a guard allowing at most `max_per_hour` remediations in any rolling hour.
+    /// A limit of 0 disables automated remediation entirely.
+    pub fn new(max_per_hour: u32) -> Self {
+        Self {
+            max_per_hour,
+            window: std::time::Duration::from_secs(3600),
+            recent: std::collections::VecDeque::new(),
+        }
+    }
+
+    /// Creates a guard with a custom window length (used by tests).
+    pub fn with_window(max_per_hour: u32, window: std::time::Duration) -> Self {
+        Self {
+            max_per_hour,
+            window,
+            recent: std::collections::VecDeque::new(),
+        }
+    }
+
+    fn prune(&mut self) {
+        let cutoff = std::time::Instant::now();
+        while let Some(front) = self.recent.front() {
+            if cutoff.duration_since(*front) >= self.window {
+                self.recent.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Number of remediations performed within the current window.
+    pub fn count_in_window(&mut self) -> usize {
+        self.prune();
+        self.recent.len()
+    }
+
+    /// Remaining budget in the current window.
+    pub fn remaining(&mut self) -> u32 {
+        let used = self.count_in_window() as u32;
+        self.max_per_hour.saturating_sub(used)
+    }
+
+    /// Consumes one unit of budget, returning false when the circuit breaker is open.
+    pub fn try_consume(&mut self) -> bool {
+        self.prune();
+        if (self.recent.len() as u32) >= self.max_per_hour {
+            return false;
+        }
+        self.recent.push_back(std::time::Instant::now());
+        true
+    }
+
+    /// Executes an action through the circuit breaker.
+    pub fn execute<P: AsRef<Path>>(
+        &mut self,
+        action: ActiveResponseAction,
+        path: P,
+        backup_dir: Option<&Path>,
+    ) -> std::io::Result<RemediationOutcome> {
+        if action == ActiveResponseAction::None {
+            return Ok(RemediationOutcome::NotConfigured);
+        }
+        if !self.try_consume() {
+            return Ok(RemediationOutcome::Declined(format!(
+                "circuit breaker open: {} remediation(s) already performed in the last hour \
+                 (limit {}); escalating to alert-only to avoid an automated response loop",
+                self.recent.len(),
+                self.max_per_hour
+            )));
+        }
+        action.execute(path, backup_dir)
     }
 }
 
 impl ActiveResponseAction {
-    /// Executes automated defensive remediation on an integrity violation
-    pub fn execute<P: AsRef<Path>>(&self, path: P, backup_dir: Option<&Path>) -> std::io::Result<String> {
+    /// Executes automated defensive remediation on an integrity violation.
+    ///
+    /// Prefer [`RemediationGuard::execute`], which additionally enforces the
+    /// per-hour circuit breaker. This method performs the action unconditionally.
+    pub fn execute<P: AsRef<Path>>(
+        &self,
+        path: P,
+        backup_dir: Option<&Path>,
+    ) -> std::io::Result<RemediationOutcome> {
         let p = path.as_ref();
         match self {
-            Self::None => Ok("No remediation configured".to_string()),
+            Self::None => Ok(RemediationOutcome::NotConfigured),
             Self::Quarantine => {
                 if !p.exists() {
-                    return Ok("Target does not exist; skipping quarantine".to_string());
+                    return Ok(RemediationOutcome::Declined(
+                        "target does not exist; nothing to quarantine".to_string(),
+                    ));
                 }
-                let q_dir = p.parent().unwrap_or_else(|| Path::new(".")).join(".quarantine");
+                let q_dir = p
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(".quarantine");
                 std::fs::create_dir_all(&q_dir)?;
                 let file_name = p.file_name().unwrap_or_default().to_string_lossy();
                 let now = std::time::SystemTime::now()
@@ -57,21 +196,69 @@ impl ActiveResponseAction {
                     .as_secs();
                 let dest = q_dir.join(format!("{}.{}.quarantined", file_name, now));
                 std::fs::rename(p, &dest)?;
-                Ok(format!("Compromised file quarantined to {}", dest.display()))
+                Ok(RemediationOutcome::Applied(format!(
+                    "compromised file quarantined to {}",
+                    dest.display()
+                )))
             }
             Self::RestoreBaseline => {
-                if let Some(b_dir) = backup_dir {
-                    let backup_file = b_dir.join(p.file_name().unwrap_or_default());
-                    if backup_file.exists() {
-                        std::fs::copy(&backup_file, p)?;
-                        return Ok(format!("Restored pristine state from {}", backup_file.display()));
+                let backup_file = match backup_dir {
+                    Some(dir) => dir.join(p.file_name().unwrap_or_default()),
+                    None => {
+                        return Ok(RemediationOutcome::Declined(
+                            "no backup directory configured, so no pristine copy is available \
+                             to restore; leaving the file in place for manual triage"
+                                .to_string(),
+                        ))
+                    }
+                };
+
+                if !backup_file.exists() {
+                    // Deliberately do NOT fall back to quarantine here.
+                    //
+                    // Quarantine *moves the file away*. Silently substituting it for a
+                    // failed restore turns "put the good copy back" into "delete the
+                    // live file", which is a destructive outcome the operator never
+                    // asked for and the single most dangerous failure mode in the
+                    // whole response path.
+                    return Ok(RemediationOutcome::Declined(format!(
+                        "no pristine backup found at {}; refusing to substitute a \
+                         destructive quarantine for the requested restore",
+                        backup_file.display()
+                    )));
+                }
+
+                // Restore via a temporary file plus rename so the monitored path is
+                // never observed truncated or half-written by the live workload.
+                let tmp = p.with_extension(format!(
+                    "{}.openfim-restore",
+                    p.extension().map(|e| e.to_string_lossy().to_string()).unwrap_or_default()
+                ));
+                std::fs::copy(&backup_file, &tmp)?;
+                match std::fs::rename(&tmp, p) {
+                    Ok(()) => Ok(RemediationOutcome::Applied(format!(
+                        "restored pristine state from {}",
+                        backup_file.display()
+                    ))),
+                    Err(e) => {
+                        let _ = std::fs::remove_file(&tmp);
+                        Err(e)
                     }
                 }
-                // Fallback to quarantine if pristine backup file is unavailable
-                Self::Quarantine.execute(p, None)
             }
             Self::KillProcess => {
-                Ok("Process termination action dispatched".to_string())
+                // Honest refusal rather than a success string for work never done.
+                //
+                // Terminating the writer requires the acting PID, which in turn
+                // requires kernel-level attribution (fanotify FAN_REPORT_PIDFD, eBPF,
+                // or a Windows minifilter). The sensor does not have that yet, so
+                // there is no process here to kill. Reporting "dispatched" would put a
+                // false containment record into the audit trail.
+                Ok(RemediationOutcome::Declined(
+                    "kill_process requires kernel-level process attribution, which this \
+                     build does not implement; no process was terminated"
+                        .to_string(),
+                ))
             }
         }
     }
@@ -247,23 +434,17 @@ impl Policy {
         Ok(s)
     }
 
-    /// Evaluates which rule applies to a given file path based on specificity precedence
+    /// Evaluates which rule applies to a given file path based on specificity precedence.
+    ///
+    /// This is the convenience / one-shot path: it compiles the policy's glob patterns
+    /// on every call. Code that evaluates many paths — the sensor's event loop, a
+    /// baseline sweep — must build a [`CompiledPolicy`] once and reuse it, otherwise
+    /// every single filesystem event re-parses every pattern in the policy.
     pub fn find_matching_rule<'a>(&'a self, path: &Path) -> Option<&'a PolicyRule> {
-        let mut candidates: Vec<(&'a PolicyRule, usize)> = Vec::new();
-
-        for rule in &self.rules {
-            if let Some(match_len) = rule_matches_path(rule, path) {
-                candidates.push((rule, match_len));
-            }
-        }
-
-        // Precedence: Longest matching path prefix wins (most specific), then highest severity
-        candidates.sort_by(|a, b| {
-            b.1.cmp(&a.1)
-                .then_with(|| b.0.severity.cmp(&a.0.severity))
-        });
-
-        candidates.first().map(|(rule, _)| *rule)
+        let compiled = CompiledPolicy::compile_rules(&self.rules);
+        let cwd = std::env::current_dir().ok();
+        CompiledPolicy::best_match_in(&compiled, &self.rules, cwd.as_deref(), path)
+            .map(|idx| &self.rules[idx])
     }
 
     /// Returns true if the path is covered by any rule and not ignored
@@ -292,100 +473,247 @@ impl Policy {
     }
 }
 
-/// Helper function to evaluate if a rule covers a path, returning match length if matched
-fn rule_matches_path(rule: &PolicyRule, path: &Path) -> Option<usize> {
-    let norm_path_str = path.to_string_lossy().replace('\\', "/");
-    let clean_path_str = norm_path_str.trim_start_matches("./");
+/// A single rule target with its glob pattern and prefix forms precompiled.
+#[derive(Debug, Clone)]
+struct CompiledTarget {
+    /// Normalized target text (forward slashes; lowercased on case-insensitive platforms).
+    normalized: String,
+    /// Normalized target with a trailing separator, for recursive prefix tests.
+    with_slash: String,
+    /// Absolute form, when the target was written relative to the working directory.
+    absolute: Option<String>,
+    /// Absolute form with a trailing separator.
+    absolute_with_slash: Option<String>,
+    /// Compiled glob, present only when the target actually contains wildcards.
+    glob: Option<Pattern>,
+    /// Specificity score used for precedence: longer target text wins.
+    specificity: usize,
+}
 
-    // Also get relative path to current directory if path is absolute
-    let cur_dir = std::env::current_dir().ok();
-    let rel_to_cur = cur_dir.as_ref().and_then(|cd| {
-        path.strip_prefix(cd)
-            .ok()
-            .map(|p| p.to_string_lossy().replace('\\', "/"))
-    });
+/// A rule with its ignore globs and targets compiled once.
+#[derive(Debug, Clone)]
+struct CompiledRule {
+    recursive: bool,
+    ignore: Vec<Pattern>,
+    targets: Vec<CompiledTarget>,
+}
 
-    // 1. Check if path matches any ignore pattern for this rule
-    for ign in &rule.ignore {
-        let norm_ign = ign.replace('\\', "/");
-        if let Ok(pattern) = Pattern::new(&norm_ign) {
-            if pattern.matches(clean_path_str) || pattern.matches(&norm_path_str) {
-                return None;
-            }
-            if let Some(ref rel) = rel_to_cur {
-                if pattern.matches(rel) {
-                    return None;
-                }
-            }
-        }
-        if norm_path_str.contains(&norm_ign) || clean_path_str.contains(&norm_ign) {
-            return None;
+/// A policy with every glob pattern compiled and the working directory resolved once.
+///
+/// Build this once and reuse it for every path evaluation. The naive alternative —
+/// recompiling each rule's patterns and calling `std::env::current_dir()` inside the
+/// match function — costs a syscall and a pattern parse per rule per filesystem
+/// event, which dominates the sensor's cost under write-heavy load.
+#[derive(Debug, Clone)]
+pub struct CompiledPolicy {
+    policy: Policy,
+    rules: Vec<CompiledRule>,
+    cwd: Option<PathBuf>,
+}
+
+/// Normalizes a path or pattern for comparison: forward slashes, and lowercase on
+/// platforms whose filesystems are case-insensitive.
+///
+/// Case folding matters on Windows: `C:\Data\app.conf` and a policy target of
+/// `C:/data/app.conf` name the same file, and a case-sensitive comparison would
+/// leave it unmonitored.
+fn normalize(text: &str) -> String {
+    let s = text.replace('\\', "/");
+    if cfg!(windows) {
+        s.to_lowercase()
+    } else {
+        s
+    }
+}
+
+fn normalize_path(path: &Path) -> String {
+    normalize(&path.to_string_lossy())
+}
+
+impl CompiledPolicy {
+    /// Compiles a policy for repeated evaluation.
+    pub fn new(policy: Policy) -> Self {
+        let rules = Self::compile_rules(&policy.rules);
+        Self {
+            cwd: std::env::current_dir().ok(),
+            rules,
+            policy,
         }
     }
 
-    // 2. Check if path matches any target rule path
-    let mut best_match_len = None;
+    fn compile_rules(rules: &[PolicyRule]) -> Vec<CompiledRule> {
+        let cwd = std::env::current_dir().ok();
+        rules
+            .iter()
+            .map(|rule| {
+                let ignore = rule
+                    .ignore
+                    .iter()
+                    .filter_map(|pat| Pattern::new(&normalize(pat)).ok())
+                    .collect();
 
-    for target in &rule.paths {
-        let norm_target = target.replace('\\', "/");
-        let clean_target = norm_target.trim_start_matches("./");
+                let targets = rule
+                    .paths
+                    .iter()
+                    .map(|target| {
+                        let normalized = normalize(target).trim_start_matches("./").to_string();
+                        let with_slash = format!("{}/", normalized.trim_end_matches('/'));
 
-        // Target absolute form if target was specified relatively
-        let abs_target = if !Path::new(target).is_absolute() {
-            cur_dir
-                .as_ref()
-                .map(|cd| cd.join(target).to_string_lossy().replace('\\', "/"))
-        } else {
-            None
-        };
+                        let absolute = if Path::new(target).is_absolute() {
+                            None
+                        } else {
+                            cwd.as_ref()
+                                .map(|cd| normalize_path(&cd.join(target)))
+                        };
+                        let absolute_with_slash = absolute
+                            .as_ref()
+                            .map(|abs| format!("{}/", abs.trim_end_matches('/')));
 
-        let is_match = norm_path_str == norm_target
-            || clean_path_str == clean_target
-            || rel_to_cur.as_deref() == Some(clean_target)
-            || abs_target.as_deref() == Some(&norm_path_str);
+                        let glob = if normalized.contains('*')
+                            || normalized.contains('?')
+                            || normalized.contains('[')
+                        {
+                            Pattern::new(&normalized).ok()
+                        } else {
+                            None
+                        };
 
-        // Exact match
-        if is_match {
-            let len = norm_target.len();
-            best_match_len = Some(best_match_len.map_or(len, |m: usize| m.max(len)));
-            continue;
-        }
+                        CompiledTarget {
+                            specificity: normalized.len(),
+                            normalized,
+                            with_slash,
+                            absolute,
+                            absolute_with_slash,
+                            glob,
+                        }
+                    })
+                    .collect();
 
-        // Subdirectory prefix match if recursive is true
-        if rule.recursive {
-            let target_with_slash = format!("{}/", clean_target.trim_end_matches('/'));
-            let abs_with_slash =
-                abs_target.as_ref().map(|at| format!("{}/", at.trim_end_matches('/')));
+                CompiledRule {
+                    recursive: rule.recursive,
+                    ignore,
+                    targets,
+                }
+            })
+            .collect()
+    }
 
-            let starts_with = norm_path_str.starts_with(&target_with_slash)
-                || clean_path_str.starts_with(&target_with_slash)
-                || rel_to_cur
-                    .as_ref()
-                    .map_or(false, |r| r.starts_with(&target_with_slash))
-                || abs_with_slash
-                    .as_ref()
-                    .map_or(false, |at| norm_path_str.starts_with(at));
+    /// The underlying policy.
+    pub fn policy(&self) -> &Policy {
+        &self.policy
+    }
 
-            if starts_with {
-                let len = norm_target.len();
-                best_match_len = Some(best_match_len.map_or(len, |m: usize| m.max(len)));
+    /// Evaluates which rule applies to a path, honouring specificity precedence.
+    pub fn find_matching_rule(&self, path: &Path) -> Option<&PolicyRule> {
+        Self::best_match_in(
+            &self.rules,
+            &self.policy.rules,
+            self.cwd.as_deref(),
+            path,
+        )
+        .map(|idx| &self.policy.rules[idx])
+    }
+
+    /// True when the path is covered by any rule and not ignored.
+    pub fn is_monitored(&self, path: &Path) -> bool {
+        self.find_matching_rule(path).is_some()
+    }
+
+    /// Returns the index of the winning rule, if any.
+    ///
+    /// Precedence: the longest matching target text wins (most specific), and
+    /// severity breaks ties. Resolved in a single pass without allocating or
+    /// sorting a candidate list, since this runs once per filesystem event.
+    fn best_match_in(
+        compiled_rules: &[CompiledRule],
+        rules: &[PolicyRule],
+        cwd: Option<&Path>,
+        path: &Path,
+    ) -> Option<usize> {
+        let norm_path = normalize_path(path);
+        let clean_path = norm_path.trim_start_matches("./");
+
+        let rel_to_cwd = cwd.and_then(|cd| {
+            path.strip_prefix(cd)
+                .ok()
+                .map(normalize_path)
+        });
+
+        let mut best: Option<(usize, usize, u32)> = None; // (rule index, specificity, severity)
+
+        for (idx, compiled) in compiled_rules.iter().enumerate() {
+            let rule = match rules.get(idx) {
+                Some(r) => r,
+                None => continue,
+            };
+
+            // 1. Ignore patterns are evaluated as globs only.
+            //
+            // A substring test here would be a security defect: an ignore entry of
+            // `log` would silently stop monitoring `/etc/catalog.conf`, and the
+            // operator would see nothing to indicate the path had been excluded.
+            let ignored = compiled.ignore.iter().any(|pattern| {
+                pattern.matches(&norm_path)
+                    || pattern.matches(clean_path)
+                    || rel_to_cwd.as_deref().is_some_and(|r| pattern.matches(r))
+                    || path
+                        .file_name()
+                        .is_some_and(|n| pattern.matches(&normalize(&n.to_string_lossy())))
+            });
+            if ignored {
                 continue;
             }
-        }
 
-        // Glob wildcard pattern match
-        if norm_target.contains('*') || norm_target.contains('?') || norm_target.contains('[') {
-            if let Ok(pattern) = Pattern::new(&norm_target) {
-                if pattern.matches(&norm_path_str) || pattern.matches(clean_path_str) {
-                    let len = norm_target.len();
-                    best_match_len = Some(best_match_len.map_or(len, |m: usize| m.max(len)));
-                    continue;
+            // 2. Target matching.
+            let mut rule_specificity: Option<usize> = None;
+            for target in &compiled.targets {
+                let exact = norm_path == target.normalized
+                    || clean_path == target.normalized
+                    || rel_to_cwd.as_deref() == Some(target.normalized.as_str())
+                    || target.absolute.as_deref() == Some(norm_path.as_str());
+
+                let prefix = compiled.recursive
+                    && (norm_path.starts_with(&target.with_slash)
+                        || clean_path.starts_with(&target.with_slash)
+                        || rel_to_cwd
+                            .as_deref()
+                            .is_some_and(|r| r.starts_with(&target.with_slash))
+                        || target
+                            .absolute_with_slash
+                            .as_deref()
+                            .is_some_and(|abs| norm_path.starts_with(abs)));
+
+                let globbed = target
+                    .glob
+                    .as_ref()
+                    .is_some_and(|g| g.matches(&norm_path) || g.matches(clean_path));
+
+                if exact || prefix || globbed {
+                    rule_specificity = Some(
+                        rule_specificity.map_or(target.specificity, |s: usize| {
+                            s.max(target.specificity)
+                        }),
+                    );
                 }
             }
-        }
-    }
 
-    best_match_len
+            if let Some(specificity) = rule_specificity {
+                let candidate = (idx, specificity, rule.severity);
+                best = match best {
+                    None => Some(candidate),
+                    Some((_, best_spec, best_sev))
+                        if specificity > best_spec
+                            || (specificity == best_spec && rule.severity > best_sev) =>
+                    {
+                        Some(candidate)
+                    }
+                    other => other,
+                };
+            }
+        }
+
+        best.map(|(idx, _, _)| idx)
+    }
 }
 
 /// Ed25519 Policy Signer and Key Utility
@@ -720,5 +1048,288 @@ rules:
 
         // 6. An unmonitored path
         assert!(!policy.is_monitored(Path::new("/opt/custom_app/data.txt")));
+    }
+
+    fn policy_with_ignore(ignore: &[&str]) -> Policy {
+        Policy {
+            version: "1.0".to_string(),
+            policy_id: "test".to_string(),
+            name: "test".to_string(),
+            author: "test".to_string(),
+            signature_algorithm: "ed25519".to_string(),
+            globals: PolicyGlobals::default(),
+            rules: vec![PolicyRule {
+                id: "R1".to_string(),
+                description: "d".to_string(),
+                paths: vec!["/etc".to_string()],
+                recursive: true,
+                mode: RuleMode::default(),
+                checks: RuleChecks::default(),
+                nodiff: false,
+                ignore: ignore.iter().map(|s| s.to_string()).collect(),
+                severity: 7,
+                whodata: true,
+                active_response: ActiveResponseConfig::default(),
+            }],
+        }
+    }
+
+    #[test]
+    fn test_ignore_entry_is_not_treated_as_a_substring() {
+        // Regression guard for a security defect: a substring-based ignore test made a
+        // bare token such as "log" silently unmonitor every path containing it, e.g.
+        // /etc/catalog.conf. Ignore entries are globs and must match as globs only.
+        let policy = policy_with_ignore(&["log"]);
+
+        assert!(
+            policy.is_monitored(Path::new("/etc/catalog.conf")),
+            "an unrelated path was excluded because the ignore entry appeared as a substring"
+        );
+        assert!(
+            policy.is_monitored(Path::new("/etc/rsyslog.conf")),
+            "an unrelated path was excluded because the ignore entry appeared as a substring"
+        );
+        // A literal, exact filename still matches.
+        assert!(!policy.is_monitored(Path::new("log")));
+    }
+
+    #[test]
+    fn test_glob_ignore_entries_still_work() {
+        let policy = policy_with_ignore(&["*.tmp", "**/cache/**"]);
+        assert!(!policy.is_monitored(Path::new("/etc/session.tmp")));
+        assert!(!policy.is_monitored(Path::new("/etc/cache/objects.bin")));
+        assert!(policy.is_monitored(Path::new("/etc/passwd")));
+    }
+
+    #[test]
+    fn test_longest_target_wins_precedence() {
+        let mut policy = policy_with_ignore(&[]);
+        policy.rules[0].severity = 1;
+        policy.rules.push(PolicyRule {
+            id: "SPECIFIC".to_string(),
+            description: "d".to_string(),
+            paths: vec!["/etc/ssh".to_string()],
+            recursive: true,
+            mode: RuleMode::default(),
+            checks: RuleChecks::default(),
+            nodiff: false,
+            ignore: vec![],
+            severity: 1,
+            whodata: true,
+            active_response: ActiveResponseConfig::default(),
+        });
+
+        let hit = policy
+            .find_matching_rule(Path::new("/etc/ssh/sshd_config"))
+            .unwrap();
+        assert_eq!(hit.id, "SPECIFIC", "the more specific rule must win");
+    }
+
+    #[test]
+    fn test_severity_breaks_specificity_ties() {
+        let mut policy = policy_with_ignore(&[]);
+        policy.rules[0].severity = 3;
+        let mut high = policy.rules[0].clone();
+        high.id = "HIGH".to_string();
+        high.severity = 9;
+        policy.rules.push(high);
+
+        let hit = policy.find_matching_rule(Path::new("/etc/passwd")).unwrap();
+        assert_eq!(hit.id, "HIGH");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn test_windows_path_matching_is_case_insensitive() {
+        // NTFS is case-insensitive, so a case-sensitive comparison would leave
+        // C:\Data\app.conf unmonitored under a policy target of C:/data.
+        let mut policy = policy_with_ignore(&[]);
+        policy.rules[0].paths = vec!["C:/data".to_string()];
+
+        assert!(policy.is_monitored(Path::new(r"C:\Data\app.conf")));
+        assert!(policy.is_monitored(Path::new(r"c:\DATA\sub\other.conf")));
+    }
+
+    #[test]
+    fn test_compiled_policy_agrees_with_one_shot_matching() {
+        let policy = policy_with_ignore(&["*.tmp"]);
+        let compiled = CompiledPolicy::new(policy.clone());
+
+        for probe in [
+            "/etc/passwd",
+            "/etc/ssh/sshd_config",
+            "/etc/scratch.tmp",
+            "/var/log/syslog",
+        ] {
+            let p = Path::new(probe);
+            assert_eq!(
+                policy.find_matching_rule(p).map(|r| r.id.clone()),
+                compiled.find_matching_rule(p).map(|r| r.id.clone()),
+                "compiled and one-shot matching disagreed on {}",
+                probe
+            );
+        }
+    }
+
+    // ---------------- Active response ----------------
+
+    #[test]
+    fn test_restore_baseline_declines_rather_than_quarantining() {
+        // The dangerous case: a restore with no pristine copy available must NOT fall
+        // back to quarantine, because quarantine moves the live file away. That turns
+        // "put the good copy back" into "delete the file".
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("production.env");
+        std::fs::write(&target, b"live production data").unwrap();
+
+        let empty_backups = dir.path().join("backups");
+        std::fs::create_dir_all(&empty_backups).unwrap();
+
+        let outcome = ActiveResponseAction::RestoreBaseline
+            .execute(&target, Some(&empty_backups))
+            .unwrap();
+
+        assert!(
+            !outcome.was_applied(),
+            "a restore with no backup must not report success"
+        );
+        assert!(
+            target.exists(),
+            "the live file was moved away by a failed restore; this is data loss"
+        );
+        assert_eq!(
+            std::fs::read(&target).unwrap(),
+            b"live production data",
+            "file contents were altered by a declined restore"
+        );
+    }
+
+    #[test]
+    fn test_restore_baseline_restores_from_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("app.conf");
+        let backups = dir.path().join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(&target, b"TAMPERED BY ADVERSARY").unwrap();
+        std::fs::write(backups.join("app.conf"), b"pristine").unwrap();
+
+        let outcome = ActiveResponseAction::RestoreBaseline
+            .execute(&target, Some(&backups))
+            .unwrap();
+
+        assert!(outcome.was_applied(), "{}", outcome.message());
+        assert_eq!(std::fs::read(&target).unwrap(), b"pristine");
+    }
+
+    #[test]
+    fn test_restore_leaves_no_temporary_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("app.conf");
+        let backups = dir.path().join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(&target, b"bad").unwrap();
+        std::fs::write(backups.join("app.conf"), b"good").unwrap();
+
+        ActiveResponseAction::RestoreBaseline
+            .execute(&target, Some(&backups))
+            .unwrap();
+
+        let strays: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("openfim-restore"))
+            .collect();
+        assert!(strays.is_empty(), "restore left a temporary file behind");
+    }
+
+    #[test]
+    fn test_quarantine_moves_the_file_aside() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("malware.bin");
+        std::fs::write(&target, b"payload").unwrap();
+
+        let outcome = ActiveResponseAction::Quarantine
+            .execute(&target, None)
+            .unwrap();
+
+        assert!(outcome.was_applied(), "{}", outcome.message());
+        assert!(!target.exists(), "quarantined file should no longer be at its path");
+        assert!(dir.path().join(".quarantine").is_dir());
+    }
+
+    #[test]
+    fn test_kill_process_does_not_claim_false_success() {
+        // Reporting "dispatched" for work never performed would write a false
+        // containment record into the audit trail.
+        let outcome = ActiveResponseAction::KillProcess
+            .execute("/tmp/whatever", None)
+            .unwrap();
+        assert!(!outcome.was_applied());
+        assert!(outcome.message().contains("attribution"));
+    }
+
+    #[test]
+    fn test_remediation_circuit_breaker_opens_after_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let backups = dir.path().join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(backups.join("f.conf"), b"good").unwrap();
+
+        let mut guard = RemediationGuard::new(3);
+        let mut applied = 0;
+        let mut declined = 0;
+
+        for _ in 0..6 {
+            let target = dir.path().join("f.conf");
+            std::fs::write(&target, b"bad").unwrap();
+            let outcome = guard
+                .execute(ActiveResponseAction::RestoreBaseline, &target, Some(&backups))
+                .unwrap();
+            if outcome.was_applied() {
+                applied += 1;
+            } else {
+                declined += 1;
+            }
+        }
+
+        assert_eq!(applied, 3, "circuit breaker did not cap remediations at the limit");
+        assert_eq!(declined, 3);
+        assert_eq!(guard.remaining(), 0);
+    }
+
+    #[test]
+    fn test_remediation_guard_window_expiry_restores_budget() {
+        let mut guard =
+            RemediationGuard::with_window(1, std::time::Duration::from_millis(80));
+        assert!(guard.try_consume());
+        assert!(!guard.try_consume(), "second attempt inside the window must be refused");
+        std::thread::sleep(std::time::Duration::from_millis(120));
+        assert!(
+            guard.try_consume(),
+            "budget should be available again once the window has rolled over"
+        );
+    }
+
+    #[test]
+    fn test_remediation_guard_zero_limit_disables_response() {
+        let mut guard = RemediationGuard::new(0);
+        let outcome = guard
+            .execute(ActiveResponseAction::Quarantine, "/tmp/x", None)
+            .unwrap();
+        assert!(!outcome.was_applied());
+    }
+
+    #[test]
+    fn test_remediation_guard_passes_through_none_without_spending_budget() {
+        let mut guard = RemediationGuard::new(1);
+        let outcome = guard
+            .execute(ActiveResponseAction::None, "/tmp/x", None)
+            .unwrap();
+        assert_eq!(outcome, RemediationOutcome::NotConfigured);
+        assert_eq!(
+            guard.remaining(),
+            1,
+            "a no-op action must not consume circuit-breaker budget"
+        );
     }
 }

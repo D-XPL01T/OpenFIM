@@ -405,18 +405,33 @@ fn test_day8_active_response_quarantine_and_restore() {
 
     // 1. Test Quarantine
     let res = ActiveResponseAction::Quarantine.execute(&target_file, None).unwrap();
-    assert!(res.contains("quarantined"));
+    assert!(res.was_applied(), "{}", res.message());
+    assert!(res.message().contains("quarantined"));
     assert!(!target_file.exists()); // Original compromised file removed
 
     let q_dir = dir.path().join(".quarantine");
     assert!(q_dir.exists());
 
     // 2. Test Restore Baseline
-    let res_restore = ActiveResponseAction::RestoreBaseline.execute(&target_file, Some(backup_dir.path())).unwrap();
-    assert!(res_restore.contains("Restored"));
+    let res_restore = ActiveResponseAction::RestoreBaseline
+        .execute(&target_file, Some(backup_dir.path()))
+        .unwrap();
+    assert!(res_restore.was_applied(), "{}", res_restore.message());
+    assert!(res_restore.message().contains("restored"));
     assert!(target_file.exists());
     let restored_content = std::fs::read(&target_file).unwrap();
     assert_eq!(restored_content, b"PRISTINE SCRIPT");
+
+    // 3. A restore with no pristine copy must decline rather than quarantine the
+    //    live file, which would destroy the very data it was asked to protect.
+    let unbacked = dir.path().join("no_backup_here.conf");
+    std::fs::write(&unbacked, b"LIVE DATA").unwrap();
+    let declined = ActiveResponseAction::RestoreBaseline
+        .execute(&unbacked, Some(backup_dir.path()))
+        .unwrap();
+    assert!(!declined.was_applied());
+    assert!(unbacked.exists(), "a failed restore must not remove the live file");
+    assert_eq!(std::fs::read(&unbacked).unwrap(), b"LIVE DATA");
 }
 
 #[test]
@@ -424,6 +439,118 @@ fn test_day9_process_who_data_resolution() {
     let ctx = ProcessContext::current();
     assert!(ctx.pid > 0);
     assert!(ctx.cmdline.is_some() || ctx.exe.is_some() || ctx.comm.is_some());
+
+    // The sensor must never present its own identity as the actor behind a change.
+    assert!(
+        !ctx.is_attributed,
+        "a self-resolved process context must not be flagged as event attribution"
+    );
+    assert!(!ProcessContext::for_observed_event().is_attributed);
+}
+
+/// Red-team scenario: the adversary trips an alert, then deletes the tail of the
+/// audit log to erase the evidence.
+///
+/// This runs against a real on-disk WAL database, the same configuration the shipped
+/// binaries use, rather than an in-memory one.
+#[test]
+fn test_adversary_cannot_erase_evidence_by_truncating_the_log() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("openfim.db");
+    let key = b"integration-test-key";
+
+    {
+        let db = BaselineDb::open(&db_path).unwrap();
+        for i in 0..6 {
+            let mut ev = SpoolEvent {
+                sequence_id: None,
+                event_id: format!("evt-{}", i),
+                timestamp_nano: 1_700_000_000_000_000_000 + i as i64,
+                event_type: "CONTENT_MUTATED".to_string(),
+                path: format!("/etc/secret{}", i),
+                severity: 10,
+                whodata_pid: None,
+                whodata_uid: None,
+                whodata_comm: None,
+                whodata_exe: None,
+                whodata_cmdline: None,
+                whodata_cgroup: None,
+                old_sha256: Some("a".repeat(64)),
+                new_sha256: Some("b".repeat(64)),
+                diff_snippet: None,
+                hmac_signature: String::new(),
+                sent_to_manager: false,
+            };
+            db.append_spool_event_chained(&mut ev, key).unwrap();
+        }
+
+        let clean = db.verify_spool_chain(key).unwrap();
+        assert!(clean.is_valid, "{:?}", clean.error_message);
+        assert_eq!(clean.total_events, 6);
+    }
+
+    // Adversary reopens the spool and removes the incriminating tail.
+    {
+        let db = BaselineDb::open(&db_path).unwrap();
+        db.connection()
+            .execute("DELETE FROM event_spool WHERE sequence_id >= 5", [])
+            .unwrap();
+    }
+
+    // A fresh process (as an auditor would run) must still catch it.
+    {
+        let db = BaselineDb::open(&db_path).unwrap();
+        let report = db.verify_spool_chain(key).unwrap();
+        assert!(
+            !report.is_valid,
+            "tail truncation of the audit log was not detected; an attacker could \
+             delete the events that incriminate them and still pass the audit"
+        );
+        let msg = report.error_message.unwrap();
+        assert!(msg.contains("truncation"), "unexpected failure reason: {}", msg);
+    }
+}
+
+/// The sensor daemon and the CLI must be able to touch the same database
+/// concurrently; the default zero busy-timeout made that fail with
+/// "database is locked" during the documented demo workflow.
+#[test]
+fn test_concurrent_readers_and_writer_do_not_deadlock() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("concurrent.db");
+    let key = b"concurrent-key";
+
+    let writer_db = BaselineDb::open(&db_path).unwrap();
+    let reader_db = BaselineDb::open(&db_path).unwrap();
+
+    for i in 0..20 {
+        let mut ev = SpoolEvent {
+            sequence_id: None,
+            event_id: format!("evt-{}", i),
+            timestamp_nano: i as i64,
+            event_type: "FILE_CREATED".to_string(),
+            path: format!("/tmp/f{}", i),
+            severity: 5,
+            whodata_pid: None,
+            whodata_uid: None,
+            whodata_comm: None,
+            whodata_exe: None,
+            whodata_cmdline: None,
+            whodata_cgroup: None,
+            old_sha256: None,
+            new_sha256: Some("c".repeat(64)),
+            diff_snippet: None,
+            hmac_signature: String::new(),
+            sent_to_manager: false,
+        };
+        writer_db.append_spool_event_chained(&mut ev, key).unwrap();
+
+        // Interleave a read from the second connection, as `audit verify` would.
+        let report = reader_db.verify_spool_chain(key).unwrap();
+        assert!(report.is_valid, "{:?}", report.error_message);
+    }
+
+    assert_eq!(reader_db.count_spool_events().unwrap(), 20);
 }
 
 

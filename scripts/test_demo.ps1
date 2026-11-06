@@ -24,6 +24,11 @@ if (Get-Command "cargo" -ErrorAction SilentlyContinue) {
 $cliExe = ".\target\debug\openfim-cli.exe"
 $agentExe = ".\target\debug\openfim-agent.exe"
 
+# The audit chain has no built-in signing key: a shipped default would be a key every
+# adversary also holds, making the tamper-evident log forgeable. Both the agent and the
+# CLI read OPENFIM_HMAC_KEY, so setting it once here covers the whole demo.
+$env:OPENFIM_HMAC_KEY = "demo-only-hmac-key-do-not-use-in-production"
+
 if (!(Test-Path $cliExe) -or !(Test-Path $agentExe)) {
     Write-Host "[*] Compiling OpenFIM workspace binaries..." -ForegroundColor Yellow
     & $cargoCmd build

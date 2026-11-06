@@ -109,11 +109,10 @@ struct RawModeGuard {
 
 impl RawModeGuard {
     fn new() -> Self {
-        if io::stdin().is_terminal() {
-            if enable_raw_mode().is_ok() {
+        if io::stdin().is_terminal()
+            && enable_raw_mode().is_ok() {
                 return Self { active: true };
             }
-        }
         Self { active: false }
     }
 }
@@ -555,7 +554,7 @@ fn op_quick_file_check() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref m) = current_meta {
         println!("File Status:         {}PRESENT ON DISK{}", GREEN, RESET);
         println!("File Size:           {} bytes", m.st_size);
-        println!("Permissions / Mode:  0o{:o}", m.st_mode);
+        println!("Permissions / Mode:  {}", crate::format_mode(m.st_mode));
         println!("Last Modified Time:  Unix timestamp {} (ctime: {})", m.st_mtime, m.st_ctime);
         println!("Computed SHA-256:    {}{}{}", GREEN, m.sha256, RESET);
         if let Some(ref b3) = m.blake3 {
@@ -590,8 +589,8 @@ fn op_quick_file_check() -> Result<(), Box<dyn std::error::Error>> {
                                 }
                                 if !meta_match {
                                     println!("      {}-> Metadata Divergence: Permissions/ownership changed!{}", RED, RESET);
-                                    println!("         Expected Mode: 0o{:o}, UID: {}", baseline.st_mode, baseline.st_uid);
-                                    println!("         Current Mode:  0o{:o}, UID: {}", cur.st_mode, cur.st_uid);
+                                    println!("         Expected Mode: {}, UID: {}", crate::format_mode(baseline.st_mode), baseline.st_uid);
+                                    println!("         Current Mode:  {}, UID: {}", crate::format_mode(cur.st_mode), cur.st_uid);
                                 }
                             }
                         } else {
@@ -1239,11 +1238,44 @@ fn run_inprocess_sensor(
     println!("{}[*] Real-time sensor active. Watching filesystem...{}", CYAN, RESET);
     println!("{}[*] Press Enter or Ctrl+C to stop monitoring.{}", YELLOW, RESET);
 
-    let hmac_key = b"openfim-sensor-secret-key";
+    // No built-in key: a shared constant would let anyone with the binary forge the
+    // audit chain, and would also silently disagree with the key the agent daemon
+    // signs with, so chains written here would fail `audit verify` there.
+    let hmac_key = match resolve_console_audit_key()? {
+        Some(k) => k,
+        None => {
+            println!(
+                "{}[!] No HMAC key available, so events cannot be signed into the \
+                 tamper-evident log. Set OPENFIM_HMAC_KEY and retry.{}",
+                RED, RESET
+            );
+            return Ok(());
+        }
+    };
+
     let mut debounce = std::collections::HashMap::new();
     let rate_bytes = 50 * 1024 * 1024;
+    let mut guard = openfim_common::RemediationGuard::new(if remediation {
+        openfim_common::DEFAULT_MAX_REMEDIATIONS_PER_HOUR
+    } else {
+        0
+    });
 
-    for _ in 0..100 {
+    // Run for a bounded wall-clock session rather than a fixed iteration count.
+    //
+    // The previous `for _ in 0..100` with a 150 ms timeout meant the "real-time"
+    // sensor quietly exited after about 15 seconds of calm, while still telling the
+    // operator it was watching until they pressed a key.
+    let session_limit = Duration::from_secs(120);
+    let started = std::time::Instant::now();
+    println!(
+        "{}[*] In-process sensor session runs for up to {} seconds.{}",
+        CYAN,
+        session_limit.as_secs(),
+        RESET
+    );
+
+    while started.elapsed() < session_limit {
         if let Ok(event) = rx.recv_timeout(Duration::from_millis(150)) {
             if !matches!(event.kind, EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)) {
                 continue;
@@ -1263,7 +1295,7 @@ fn run_inprocess_sensor(
                 }
                 debounce.insert(path.clone(), now);
 
-                let whodata = openfim_common::ProcessContext::current();
+                let whodata = openfim_common::ProcessContext::for_observed_event();
                 let ts_nano = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -1277,8 +1309,19 @@ fn run_inprocess_sensor(
                                 println!("\n{}[!] CRITICAL INTEGRITY ALERT: CONTENT_MUTATED on {}{}", RED, path.display(), RESET);
                                 println!("    Old Hash: {}", base_meta.sha256);
                                 println!("    New Hash: {}", cur_meta.sha256);
-                                println!("    Who-Data: PID={} Exe={:?}", whodata.pid, whodata.exe);
+                                if whodata.is_attributed {
+                                    println!(
+                                        "    Who-Data: PID={} Exe={:?}",
+                                        whodata.pid, whodata.exe
+                                    );
+                                } else {
+                                    println!(
+                                        "    Who-Data: {}UNATTRIBUTED{} - the writing process could not be identified",
+                                        YELLOW, RESET
+                                    );
+                                }
 
+                                let attributed = whodata.is_attributed;
                                 let mut spool = openfim_common::SpoolEvent {
                                     sequence_id: None,
                                     event_id: format!("evt-{}", ts_nano),
@@ -1286,11 +1329,18 @@ fn run_inprocess_sensor(
                                     event_type: "CONTENT_MUTATED".to_string(),
                                     path: openfim_common::normalize_path_str(&path),
                                     severity: rule.severity,
-                                    whodata_pid: Some(whodata.pid),
-                                    whodata_uid: whodata.uid,
-                                    whodata_comm: whodata.comm.clone(),
-                                    whodata_exe: whodata.exe.clone(),
-                                    whodata_cmdline: whodata.cmdline.clone(),
+                                    // Leave these empty unless they really describe the
+                                    // actor; otherwise every event would name OpenFIM
+                                    // itself as the process that made the change.
+                                    whodata_pid: attributed.then_some(whodata.pid),
+                                    whodata_uid: if attributed { whodata.uid } else { None },
+                                    whodata_comm: if attributed { whodata.comm.clone() } else { None },
+                                    whodata_exe: if attributed { whodata.exe.clone() } else { None },
+                                    whodata_cmdline: if attributed {
+                                        whodata.cmdline.clone()
+                                    } else {
+                                        None
+                                    },
                                     whodata_cgroup: None,
                                     old_sha256: Some(base_meta.sha256),
                                     new_sha256: Some(cur_meta.sha256),
@@ -1298,12 +1348,31 @@ fn run_inprocess_sensor(
                                     hmac_signature: String::new(),
                                     sent_to_manager: false,
                                 };
-                                let _ = db.append_spool_event_chained(&mut spool, hmac_key);
+                                if let Err(e) =
+                                    db.append_spool_event_chained(&mut spool, &hmac_key)
+                                {
+                                    println!(
+                                        "    {}[!] Failed to record this event to the audit chain: {}{}",
+                                        RED, e, RESET
+                                    );
+                                }
 
                                 if remediation {
                                     let b_path = backup_dir.map(Path::new);
-                                    let res = rule.active_response.action.execute(&path, b_path);
-                                    println!("    {}[REMEDIATION] => {:?}{}", GREEN, res, RESET);
+                                    match guard.execute(
+                                        rule.active_response.action,
+                                        &path,
+                                        b_path,
+                                    ) {
+                                        Ok(outcome) => println!(
+                                            "    {}[REMEDIATION] {}{}",
+                                            GREEN, outcome, RESET
+                                        ),
+                                        Err(e) => println!(
+                                            "    {}[REMEDIATION] failed: {}{}",
+                                            RED, e, RESET
+                                        ),
+                                    }
                                 }
                             }
                         }
@@ -1314,6 +1383,26 @@ fn run_inprocess_sensor(
     }
 
     Ok(())
+}
+
+/// Resolves the audit-chain HMAC key for interactive use.
+///
+/// Prefers `OPENFIM_HMAC_KEY` so the secret is not retyped into terminal scrollback,
+/// and falls back to prompting. Returns `Ok(None)` when the operator supplies nothing
+/// or navigates back; there is deliberately no default value.
+fn resolve_console_audit_key() -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    if let Ok(env_key) = std::env::var("OPENFIM_HMAC_KEY") {
+        let trimmed = env_key.trim();
+        if !trimmed.is_empty() {
+            println!("{}[i] Using HMAC key from OPENFIM_HMAC_KEY.{}", DIM, RESET);
+            return Ok(Some(trimmed.as_bytes().to_vec()));
+        }
+    }
+
+    match prompt_input("HMAC secret key (no default; or set OPENFIM_HMAC_KEY)", None, true)? {
+        Some(s) if !s.trim().is_empty() => Ok(Some(s.trim().as_bytes().to_vec())),
+        _ => Ok(None),
+    }
 }
 
 /// Operation 4: Forensics & Audit Log (with Backspace return support)
@@ -1327,9 +1416,19 @@ fn op_forensics_and_audit() -> Result<(), Box<dyn std::error::Error>> {
         Some(s) => s,
         None => return Ok(()),
     };
-    let key_str = match prompt_input("HMAC secret key", Some("openfim-sensor-secret-key"), true)? {
-        Some(s) => s,
-        None => return Ok(()),
+    // Offered with no default. A shipped default key is a key every adversary also
+    // has, which would make the "tamper-evident" chain forgeable at will.
+    let key_str = match resolve_console_audit_key()? {
+        Some(k) => k,
+        None => {
+            println!(
+                "{}[-] No HMAC key provided; the audit chain cannot be verified without \
+                 the key it was signed with.{}",
+                RED, RESET
+            );
+            prompt_press_enter();
+            return Ok(());
+        }
     };
 
     let db_path = Path::new(&db_str);
@@ -1342,7 +1441,7 @@ fn op_forensics_and_audit() -> Result<(), Box<dyn std::error::Error>> {
     let db = BaselineDb::open(db_path)?;
 
     println!("{}[*] Cryptographically auditing HMAC chain and sequence continuity...{}", CYAN, RESET);
-    let report = db.verify_spool_chain(key_str.as_bytes())?;
+    let report = db.verify_spool_chain(&key_str)?;
 
     if report.is_valid {
         println!("\n{}============================================================", GREEN);

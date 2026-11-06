@@ -1,5 +1,11 @@
 use std::time::{Duration, Instant};
 
+/// Upper bound on any single throttle wait, in seconds.
+///
+/// This exists so that a misconfigured very low rate limit degrades into slow
+/// progress rather than an apparent hang inside one `consume` call.
+const MAX_SINGLE_WAIT_SECS: f64 = 2.0;
+
 /// Token-Bucket Rate Limiter to restrict I/O bandwidth and prevent disk thrashing.
 #[derive(Debug)]
 pub struct TokenBucket {
@@ -66,7 +72,13 @@ impl TokenBucket {
         // Deficit: calculate required sleep duration
         let deficit = requested - self.tokens;
         let sleep_seconds = deficit / (self.bytes_per_second as f64);
-        let sleep_duration = Duration::from_secs_f64(sleep_seconds);
+
+        // Clamp the wait. A pathologically low rate limit combined with a 64 KB read
+        // chunk yields an arithmetically correct sleep of many hours, which would hang
+        // the scan with no diagnostic. Capping each wait keeps the limiter responsive
+        // and still enforces the configured rate in aggregate across chunks.
+        let sleep_duration =
+            Duration::from_secs_f64(sleep_seconds.clamp(0.0, MAX_SINGLE_WAIT_SECS));
 
         std::thread::sleep(sleep_duration);
 
@@ -114,5 +126,32 @@ mod tests {
         limiter.consume(50 * 1024);
         let elapsed = start.elapsed();
         assert!(elapsed >= Duration::from_millis(400), "Elapsed time was {:?}", elapsed);
+    }
+
+    #[test]
+    fn test_single_wait_is_bounded_for_tiny_rate() {
+        // A 1 byte/sec limit against a 64 KB chunk is an 18-hour wait if computed
+        // literally. The limiter must cap each individual wait instead of hanging.
+        let mut limiter = TokenBucket::new(1);
+        limiter.tokens = 0.0;
+        limiter.last_refill = Instant::now();
+
+        let start = Instant::now();
+        limiter.consume(64 * 1024);
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "a single consume call blocked for {:?}; the throttle wait is unbounded",
+            elapsed
+        );
+    }
+
+    #[test]
+    fn test_zero_byte_consume_is_free() {
+        let mut limiter = TokenBucket::new(1024);
+        let start = Instant::now();
+        limiter.consume(0);
+        assert!(start.elapsed() < Duration::from_millis(50));
     }
 }

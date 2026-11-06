@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use hmac::{Hmac, Mac};
 use rusqlite::{params, Connection};
@@ -90,7 +90,112 @@ pub struct SpoolAuditReport {
     pub error_message: Option<String>,
 }
 
-/// Computes an HMAC-SHA256 signature chaining from the previous event's signature
+/// Domain separation tag, so a chain from one schema version can never be replayed
+/// as a valid chain under another.
+const HMAC_CHAIN_DOMAIN: &[u8] = b"openfim.event_spool.v2";
+
+/// Absorbs one named field into the MAC with an explicit length prefix.
+///
+/// Length prefixing is what makes the authenticated field set unambiguous. With bare
+/// concatenation, the fields `("ab", "c")` and `("a", "bc")` produce identical MAC
+/// input, so an attacker can shift bytes across a field boundary and keep the
+/// signature valid. The presence tag distinguishes an absent optional field from an
+/// empty one.
+fn mac_field(mac: &mut HmacSha256, label: &[u8], value: Option<&[u8]>) {
+    mac.update(&(label.len() as u64).to_le_bytes());
+    mac.update(label);
+    match value {
+        Some(v) => {
+            mac.update(&[1u8]);
+            mac.update(&(v.len() as u64).to_le_bytes());
+            mac.update(v);
+        }
+        None => {
+            mac.update(&[0u8]);
+            mac.update(&0u64.to_le_bytes());
+        }
+    }
+}
+
+/// Computes the HMAC-SHA256 signature for an event, chained from its predecessor.
+///
+/// Every security-relevant field of the event is authenticated, not just a handful.
+/// Leaving fields out of the MAC — severity, the who-data attribution, the previous
+/// hash — lets an attacker who reaches the database rewrite exactly the forensic
+/// detail that matters (downgrade the severity, repoint the acting process, erase
+/// the pre-tamper hash) while the chain still verifies as intact.
+pub fn compute_event_hmac_for(key: &[u8], prev_hmac: &str, event: &SpoolEvent) -> String {
+    let mut mac = HmacSha256::new_from_slice(key).expect("HMAC supports arbitrary key length");
+
+    mac_field(&mut mac, b"domain", Some(HMAC_CHAIN_DOMAIN));
+    mac_field(&mut mac, b"prev", Some(prev_hmac.as_bytes()));
+    mac_field(&mut mac, b"event_id", Some(event.event_id.as_bytes()));
+    mac_field(
+        &mut mac,
+        b"timestamp_nano",
+        Some(&event.timestamp_nano.to_le_bytes()),
+    );
+    mac_field(&mut mac, b"event_type", Some(event.event_type.as_bytes()));
+    mac_field(&mut mac, b"path", Some(event.path.as_bytes()));
+    mac_field(&mut mac, b"severity", Some(&event.severity.to_le_bytes()));
+    mac_field(
+        &mut mac,
+        b"whodata_pid",
+        event.whodata_pid.map(|v| v.to_le_bytes()).as_ref().map(|b| &b[..]),
+    );
+    mac_field(
+        &mut mac,
+        b"whodata_uid",
+        event.whodata_uid.map(|v| v.to_le_bytes()).as_ref().map(|b| &b[..]),
+    );
+    mac_field(
+        &mut mac,
+        b"whodata_comm",
+        event.whodata_comm.as_deref().map(|s| s.as_bytes()),
+    );
+    mac_field(
+        &mut mac,
+        b"whodata_exe",
+        event.whodata_exe.as_deref().map(|s| s.as_bytes()),
+    );
+    mac_field(
+        &mut mac,
+        b"whodata_cmdline",
+        event.whodata_cmdline.as_deref().map(|s| s.as_bytes()),
+    );
+    mac_field(
+        &mut mac,
+        b"whodata_cgroup",
+        event.whodata_cgroup.as_deref().map(|s| s.as_bytes()),
+    );
+    mac_field(
+        &mut mac,
+        b"old_sha256",
+        event.old_sha256.as_deref().map(|s| s.as_bytes()),
+    );
+    mac_field(
+        &mut mac,
+        b"new_sha256",
+        event.new_sha256.as_deref().map(|s| s.as_bytes()),
+    );
+    mac_field(
+        &mut mac,
+        b"diff_snippet",
+        event.diff_snippet.as_deref().map(|s| s.as_bytes()),
+    );
+
+    hex::encode(mac.finalize().into_bytes())
+}
+
+/// Legacy five-field chaining helper.
+///
+/// Retained so existing callers keep compiling, but it authenticates only a subset of
+/// each event. Use [`compute_event_hmac_for`] for anything that must be
+/// tamper-evident.
+#[deprecated(
+    since = "0.1.0",
+    note = "authenticates only 5 of the event's fields; use compute_event_hmac_for"
+)]
 pub fn compute_event_hmac(
     key: &[u8],
     prev_hmac: &str,
@@ -111,6 +216,10 @@ pub fn compute_event_hmac(
     }
     hex::encode(mac.finalize().into_bytes())
 }
+
+/// The genesis value that seeds the chain before any event has been written.
+pub const CHAIN_GENESIS_HMAC: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 /// Canonicalizes/normalizes a path string for consistent database keying across OS path separators
 pub fn normalize_path_str<P: AsRef<Path>>(p: P) -> String {
@@ -153,6 +262,15 @@ impl BaselineDb {
         self.conn.pragma_update(None, "journal_mode", "WAL")?;
         self.conn.pragma_update(None, "synchronous", "NORMAL")?;
         self.conn.pragma_update(None, "foreign_keys", "ON")?;
+
+        // Wait for a contended write lock instead of failing instantly.
+        //
+        // The sensor daemon holds the database open continuously while the CLI is
+        // expected to run `audit verify` and `baseline diff` against the same file.
+        // With SQLite's default zero timeout, those concurrent commands fail outright
+        // with SQLITE_BUSY ("database is locked") rather than waiting their turn.
+        self.conn
+            .busy_timeout(std::time::Duration::from_secs(10))?;
 
         self.conn.execute_batch(
             r#"
@@ -205,10 +323,37 @@ impl BaselineDb {
             );
 
             CREATE INDEX IF NOT EXISTS idx_spool_unsent ON event_spool(sent_to_manager, sequence_id);
+
+            -- Append-only chain anchor.
+            --
+            -- Without a persisted record of where the chain head should be, deleting
+            -- the most recent N rows leaves a shorter but internally consistent chain
+            -- that verifies as clean. An attacker who trips an alert would simply
+            -- delete the tail. This table records the expected head so truncation is
+            -- detectable, and it is updated in the same transaction as each append.
+            CREATE TABLE IF NOT EXISTS chain_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                last_sequence_id INTEGER NOT NULL,
+                last_hmac TEXT NOT NULL,
+                event_count INTEGER NOT NULL
+            );
             "#,
         )?;
 
         Ok(())
+    }
+
+    /// Reads the persisted chain anchor, if one exists.
+    fn read_chain_anchor(&self) -> Result<Option<(i64, String, i64)>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT last_sequence_id, last_hmac, event_count FROM chain_meta WHERE id = 1",
+        )?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?)))
+        } else {
+            Ok(None)
+        }
     }
 
     /// Inserts or replaces a single baseline entry
@@ -262,6 +407,7 @@ impl BaselineDb {
             .unwrap_or_default()
             .as_secs() as i64;
 
+        let mut inserted = 0usize;
         let tx = self.conn.transaction()?;
         {
             let mut stmt = tx.prepare_cached(
@@ -276,7 +422,7 @@ impl BaselineDb {
 
             for entry in entries {
                 let path_str = normalize_path_str(&entry.path);
-                stmt.execute(params![
+                inserted += stmt.execute(params![
                     path_str,
                     entry.sha256,
                     entry.blake3,
@@ -301,7 +447,9 @@ impl BaselineDb {
             }
         }
         tx.commit()?;
-        Ok(entries.len())
+        // Report rows actually written rather than the input length, so a caller can
+        // tell a partially-applied batch from a fully-applied one.
+        Ok(inserted)
     }
 
     /// Retrieves an entry by path from baseline with cross-platform separator normalization
@@ -332,6 +480,11 @@ impl BaselineDb {
             SELECT path, sha256, blake3, file_size, mode, uid, gid, inode, dev, nlink,
                    mtime, mtime_nsec, ctime, xattrs_hash, acl_hash, symlink_target, is_symlink, is_dir
             FROM baseline_entries WHERE path = ?1 OR path = ?2 OR path = ?3
+            -- Deterministic preference: the caller's own spelling first, then the
+            -- absolute form, then the working-directory-relative form. Without this
+            -- the row returned for an ambiguous lookup depends on storage order.
+            ORDER BY CASE path WHEN ?1 THEN 0 WHEN ?2 THEN 1 ELSE 2 END
+            LIMIT 1
             "#,
         )?;
 
@@ -426,17 +579,19 @@ impl BaselineDb {
         scope: Option<P>,
     ) -> Result<BaselineDiff> {
         let baseline_entries = self.get_all_entries()?;
-        let mut baseline_map: HashMap<String, FileMetadata> = HashMap::new();
+        let mut baseline_map: HashMap<String, FileMetadata> = HashMap::with_capacity(
+            baseline_entries.len(),
+        );
         for b in baseline_entries {
             baseline_map.insert(normalize_path_str(&b.path), b);
         }
 
         let mut diff = BaselineDiff::default();
-        let mut observed_paths = HashMap::new();
+        let mut observed_paths: HashSet<String> = HashSet::with_capacity(current_snapshot.len());
 
         for current in current_snapshot {
             let norm_current = normalize_path_str(&current.path);
-            observed_paths.insert(norm_current.clone(), ());
+            observed_paths.insert(norm_current.clone());
 
             match baseline_map.get(&norm_current) {
                 None => {
@@ -472,16 +627,25 @@ impl BaselineDb {
             }
         }
 
-        let scope_norm = scope.as_ref().map(|s| normalize_path_str(s));
+        let scope_norm = scope
+            .as_ref()
+            .map(|s| normalize_path_str(s).trim_end_matches('/').to_string());
+        let scope_prefix = scope_norm.as_ref().map(|sc| format!("{}/", sc));
 
         // Check for removed files (in baseline, but not observed in current scan)
         for (base_key, base_meta) in baseline_map {
-            if let Some(ref sc) = scope_norm {
-                if !base_key.starts_with(sc) && !base_key.starts_with(&format!("{}/", sc)) {
+            if let (Some(sc), Some(prefix)) = (scope_norm.as_ref(), scope_prefix.as_ref()) {
+                // Must be the scope root itself or sit beneath it.
+                //
+                // A bare `starts_with(scope)` test also matches sibling paths that
+                // merely share a textual prefix: scoping a diff to `/etc` would drag
+                // in `/etcetera/...` and report its files as deleted.
+                let in_scope = &base_key == sc || base_key.starts_with(prefix);
+                if !in_scope {
                     continue;
                 }
             }
-            if !observed_paths.contains_key(&base_key) {
+            if !observed_paths.contains(&base_key) {
                 diff.removed.push(base_meta);
             }
         }
@@ -593,83 +757,176 @@ impl BaselineDb {
         if let Some(row) = rows.next()? {
             Ok(row.get(0)?)
         } else {
-            Ok("0".repeat(64))
+            Ok(CHAIN_GENESIS_HMAC.to_string())
         }
     }
 
-    /// Cryptographically signs and appends an event to the local append-only HMAC chain
+    /// Cryptographically signs and appends an event to the local append-only HMAC chain.
+    ///
+    /// The event row and the chain anchor are written in one transaction, so the
+    /// anchor can never disagree with the chain because of a crash mid-append.
     pub fn append_spool_event_chained(&self, event: &mut SpoolEvent, hmac_key: &[u8]) -> Result<i64> {
-        let prev_hmac = self.get_last_spool_hmac()?;
-        event.hmac_signature = compute_event_hmac(
-            hmac_key,
-            &prev_hmac,
-            &event.event_id,
-            event.timestamp_nano,
-            &event.path,
-            &event.event_type,
-            event.new_sha256.as_deref(),
-        );
-        self.append_spool_event(event)
+        let tx = self.conn.unchecked_transaction()?;
+
+        // Chain from the anchor when present; it is the authoritative head.
+        let (prev_hmac, prev_count) = match self.read_chain_anchor()? {
+            Some((_, last_hmac, count)) => (last_hmac, count),
+            None => (self.get_last_spool_hmac()?, self.count_spool_events()? as i64),
+        };
+
+        event.hmac_signature = compute_event_hmac_for(hmac_key, &prev_hmac, event);
+        let seq = self.append_spool_event(event)?;
+
+        tx.execute(
+            r#"
+            INSERT INTO chain_meta (id, last_sequence_id, last_hmac, event_count)
+            VALUES (1, ?1, ?2, ?3)
+            ON CONFLICT(id) DO UPDATE SET
+                last_sequence_id = excluded.last_sequence_id,
+                last_hmac        = excluded.last_hmac,
+                event_count      = excluded.event_count
+            "#,
+            params![seq, event.hmac_signature, prev_count + 1],
+        )?;
+
+        tx.commit()?;
+        event.sequence_id = Some(seq);
+        Ok(seq)
     }
 
-    /// Verifies the entire offline event spool HMAC chain and sequence continuity
+    /// Total number of rows currently in the event spool.
+    pub fn count_spool_events(&self) -> Result<usize> {
+        let count: i64 = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM event_spool", [], |r| r.get(0))?;
+        Ok(count as usize)
+    }
+
+    /// Verifies the entire offline event spool HMAC chain, sequence continuity, and
+    /// agreement with the persisted chain anchor.
+    ///
+    /// Three distinct tampering modes are detected:
+    ///
+    /// 1. **Payload edits** — any authenticated field changed, so the recomputed MAC
+    ///    no longer matches the stored one.
+    /// 2. **Interior deletion** — a gap appears in the autoincrement sequence.
+    /// 3. **Tail truncation** — the surviving rows still chain correctly, but the head
+    ///    no longer matches the anchor recorded when the last event was appended.
+    ///    Without check 3 an attacker simply deletes the rows that incriminate them.
     pub fn verify_spool_chain(&self, hmac_key: &[u8]) -> Result<SpoolAuditReport> {
         let mut stmt = self.conn.prepare(
-            "SELECT sequence_id, event_id, timestamp_nano, event_type, path, new_sha256, hmac_signature 
-             FROM event_spool ORDER BY sequence_id ASC",
+            r#"
+            SELECT sequence_id, event_id, timestamp_nano, event_type, path, severity,
+                   whodata_pid, whodata_uid, whodata_comm, whodata_exe, whodata_cmdline,
+                   whodata_cgroup, old_sha256, new_sha256, diff_snippet, hmac_signature,
+                   sent_to_manager
+            FROM event_spool ORDER BY sequence_id ASC
+            "#,
         )?;
         let rows = stmt.query_map([], |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, Option<String>>(5)?,
-                row.get::<_, String>(6)?,
+                SpoolEvent {
+                    sequence_id: Some(row.get::<_, i64>(0)?),
+                    event_id: row.get(1)?,
+                    timestamp_nano: row.get(2)?,
+                    event_type: row.get(3)?,
+                    path: row.get(4)?,
+                    severity: row.get::<_, i64>(5)? as u32,
+                    whodata_pid: row.get::<_, Option<i64>>(6)?.map(|v| v as u32),
+                    whodata_uid: row.get::<_, Option<i64>>(7)?.map(|v| v as u32),
+                    whodata_comm: row.get(8)?,
+                    whodata_exe: row.get(9)?,
+                    whodata_cmdline: row.get(10)?,
+                    whodata_cgroup: row.get(11)?,
+                    old_sha256: row.get(12)?,
+                    new_sha256: row.get(13)?,
+                    diff_snippet: row.get(14)?,
+                    hmac_signature: row.get(15)?,
+                    sent_to_manager: row.get::<_, i64>(16)? == 1,
+                },
             ))
         })?;
 
-        let mut prev_hmac = "0".repeat(64);
-        let mut expected_seq = 1i64;
-        let mut count = 0;
+        let mut prev_hmac = CHAIN_GENESIS_HMAC.to_string();
+        let mut count = 0usize;
+        let mut last_seq = 0i64;
 
-        for r in rows {
-            let (seq, event_id, ts, ev_type, path, new_hash, recorded_hmac) = r?;
+        for (position, r) in rows.enumerate() {
+            let (seq, event) = r?;
+            // Autoincrement sequence ids start at 1 and must be contiguous.
+            let expected_seq = position as i64 + 1;
+
             if seq != expected_seq {
                 return Ok(SpoolAuditReport {
                     total_events: count,
                     is_valid: false,
                     tampered_sequence_id: Some(seq),
                     error_message: Some(format!(
-                        "Sequence gap detected: expected {}, found {}",
+                        "Sequence gap detected: expected {}, found {}. \
+                         Event(s) were deleted from the middle of the append-only log.",
                         expected_seq, seq
                     )),
                 });
             }
-            let expected_hmac = compute_event_hmac(
-                hmac_key,
-                &prev_hmac,
-                &event_id,
-                ts,
-                &path,
-                &ev_type,
-                new_hash.as_deref(),
-            );
-            if expected_hmac != recorded_hmac {
+
+            let expected_hmac = compute_event_hmac_for(hmac_key, &prev_hmac, &event);
+            if expected_hmac != event.hmac_signature {
                 return Ok(SpoolAuditReport {
                     total_events: count,
                     is_valid: false,
                     tampered_sequence_id: Some(seq),
                     error_message: Some(format!(
-                        "Cryptographic HMAC mismatch at sequence {}",
+                        "Cryptographic HMAC mismatch at sequence {}. \
+                         An authenticated field of this event was modified after it was recorded.",
                         seq
                     )),
                 });
             }
-            prev_hmac = recorded_hmac;
-            expected_seq += 1;
+
+            prev_hmac = event.hmac_signature.clone();
+            last_seq = seq;
             count += 1;
+        }
+
+        // Truncation check against the persisted anchor.
+        if let Some((anchor_seq, anchor_hmac, anchor_count)) = self.read_chain_anchor()? {
+            if (count as i64) < anchor_count || last_seq < anchor_seq {
+                return Ok(SpoolAuditReport {
+                    total_events: count,
+                    is_valid: false,
+                    tampered_sequence_id: Some(last_seq.max(0)),
+                    error_message: Some(format!(
+                        "Chain truncation detected: the anchor records {} event(s) up to \
+                         sequence {}, but only {} event(s) up to sequence {} remain. \
+                         Event(s) were deleted from the end of the append-only log.",
+                        anchor_count, anchor_seq, count, last_seq
+                    )),
+                });
+            }
+            if count as i64 == anchor_count && prev_hmac != anchor_hmac {
+                return Ok(SpoolAuditReport {
+                    total_events: count,
+                    is_valid: false,
+                    tampered_sequence_id: Some(last_seq.max(0)),
+                    error_message: Some(
+                        "Chain head mismatch: the final event's signature does not match the \
+                         recorded anchor. The log was rewritten."
+                            .to_string(),
+                    ),
+                });
+            }
+        } else if count > 0 {
+            return Ok(SpoolAuditReport {
+                total_events: count,
+                is_valid: false,
+                tampered_sequence_id: Some(1),
+                error_message: Some(
+                    "Chain anchor is missing while events are present. Either the anchor row \
+                     was deleted, or these events predate anchored chaining."
+                        .to_string(),
+                ),
+            });
         }
 
         Ok(SpoolAuditReport {
@@ -999,5 +1256,272 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event_type, "CONTENT_MUTATED");
         assert_eq!(events[0].whodata_comm.as_deref(), Some("vim"));
+    }
+
+    // ---------------- Tamper-evident chain ----------------
+
+    const TEST_KEY: &[u8] = b"test-hmac-key";
+
+    fn spool_event(id: &str, path: &str) -> SpoolEvent {
+        SpoolEvent {
+            sequence_id: None,
+            event_id: id.to_string(),
+            timestamp_nano: 1_700_000_000_000_000_000,
+            event_type: "CONTENT_MUTATED".to_string(),
+            path: path.to_string(),
+            severity: 9,
+            whodata_pid: Some(4242),
+            whodata_uid: Some(0),
+            whodata_comm: Some("attacker".to_string()),
+            whodata_exe: Some("/usr/bin/attacker".to_string()),
+            whodata_cmdline: Some("attacker --exfil".to_string()),
+            whodata_cgroup: None,
+            old_sha256: Some("a".repeat(64)),
+            new_sha256: Some("b".repeat(64)),
+            diff_snippet: None,
+            hmac_signature: String::new(),
+            sent_to_manager: false,
+        }
+    }
+
+    fn seeded_db(n: usize) -> BaselineDb {
+        let db = BaselineDb::open_in_memory().unwrap();
+        for i in 0..n {
+            let mut ev = spool_event(&format!("evt-{}", i), &format!("/etc/file{}", i));
+            db.append_spool_event_chained(&mut ev, TEST_KEY).unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn test_clean_chain_verifies() {
+        let db = seeded_db(5);
+        let report = db.verify_spool_chain(TEST_KEY).unwrap();
+        assert!(report.is_valid, "{:?}", report.error_message);
+        assert_eq!(report.total_events, 5);
+    }
+
+    #[test]
+    fn test_wrong_key_fails_verification() {
+        let db = seeded_db(3);
+        let report = db.verify_spool_chain(b"not-the-right-key").unwrap();
+        assert!(!report.is_valid);
+    }
+
+    #[test]
+    fn test_interior_deletion_is_detected() {
+        let db = seeded_db(5);
+        db.connection()
+            .execute("DELETE FROM event_spool WHERE sequence_id = 3", [])
+            .unwrap();
+        let report = db.verify_spool_chain(TEST_KEY).unwrap();
+        assert!(!report.is_valid);
+        assert!(report.error_message.unwrap().contains("Sequence gap"));
+    }
+
+    #[test]
+    fn test_tail_truncation_is_detected() {
+        // The critical case the anchor exists for. The surviving rows still chain
+        // correctly to each other, so without an anchor this verifies as clean and an
+        // attacker can erase the events that incriminate them.
+        let db = seeded_db(5);
+        db.connection()
+            .execute("DELETE FROM event_spool WHERE sequence_id >= 4", [])
+            .unwrap();
+
+        let report = db.verify_spool_chain(TEST_KEY).unwrap();
+        assert!(
+            !report.is_valid,
+            "deleting the tail of the log must not verify as a clean chain"
+        );
+        assert!(
+            report.error_message.unwrap().contains("truncation"),
+            "truncation should be reported as such"
+        );
+    }
+
+    #[test]
+    fn test_deleting_entire_log_is_detected() {
+        let db = seeded_db(4);
+        db.connection().execute("DELETE FROM event_spool", []).unwrap();
+        let report = db.verify_spool_chain(TEST_KEY).unwrap();
+        assert!(!report.is_valid, "wiping the log must be detectable");
+    }
+
+    #[test]
+    fn test_anchor_removal_is_detected() {
+        let db = seeded_db(3);
+        db.connection().execute("DELETE FROM chain_meta", []).unwrap();
+        let report = db.verify_spool_chain(TEST_KEY).unwrap();
+        assert!(!report.is_valid);
+    }
+
+    #[test]
+    fn test_empty_log_is_valid() {
+        let db = BaselineDb::open_in_memory().unwrap();
+        let report = db.verify_spool_chain(TEST_KEY).unwrap();
+        assert!(report.is_valid);
+        assert_eq!(report.total_events, 0);
+    }
+
+    /// Every authenticated field must be covered by the MAC. Rewriting any of them
+    /// in place has to break verification; a field left out of the MAC is a field an
+    /// attacker with database access can quietly rewrite.
+    #[test]
+    fn test_every_forensic_field_is_authenticated() {
+        let mutations: &[(&str, &str)] = &[
+            ("severity", "UPDATE event_spool SET severity = 1 WHERE sequence_id = 2"),
+            ("path", "UPDATE event_spool SET path = '/etc/decoy' WHERE sequence_id = 2"),
+            ("event_type", "UPDATE event_spool SET event_type = 'FILE_CREATED' WHERE sequence_id = 2"),
+            ("event_id", "UPDATE event_spool SET event_id = 'forged' WHERE sequence_id = 2"),
+            ("timestamp_nano", "UPDATE event_spool SET timestamp_nano = 1 WHERE sequence_id = 2"),
+            ("whodata_pid", "UPDATE event_spool SET whodata_pid = 1 WHERE sequence_id = 2"),
+            ("whodata_uid", "UPDATE event_spool SET whodata_uid = 1000 WHERE sequence_id = 2"),
+            ("whodata_comm", "UPDATE event_spool SET whodata_comm = 'bash' WHERE sequence_id = 2"),
+            ("whodata_exe", "UPDATE event_spool SET whodata_exe = '/bin/bash' WHERE sequence_id = 2"),
+            ("whodata_cmdline", "UPDATE event_spool SET whodata_cmdline = 'ls' WHERE sequence_id = 2"),
+            ("whodata_cgroup", "UPDATE event_spool SET whodata_cgroup = '/system.slice' WHERE sequence_id = 2"),
+            ("old_sha256", "UPDATE event_spool SET old_sha256 = NULL WHERE sequence_id = 2"),
+            ("new_sha256", "UPDATE event_spool SET new_sha256 = NULL WHERE sequence_id = 2"),
+            ("diff_snippet", "UPDATE event_spool SET diff_snippet = 'injected' WHERE sequence_id = 2"),
+        ];
+
+        for (field, sql) in mutations {
+            let db = seeded_db(4);
+            assert!(
+                db.verify_spool_chain(TEST_KEY).unwrap().is_valid,
+                "baseline chain should start valid"
+            );
+
+            db.connection().execute(sql, []).unwrap();
+            let report = db.verify_spool_chain(TEST_KEY).unwrap();
+
+            assert!(
+                !report.is_valid,
+                "tampering with `{}` was not detected; the field is not covered by the \
+                 event MAC and can be rewritten undetected",
+                field
+            );
+            assert_eq!(
+                report.tampered_sequence_id,
+                Some(2),
+                "wrong sequence id pinpointed for tampered field `{}`",
+                field
+            );
+        }
+    }
+
+    #[test]
+    fn test_length_prefixing_prevents_field_boundary_shifting() {
+        // With bare concatenation, moving bytes across a field boundary keeps the MAC
+        // input byte-identical. Length prefixes must make these two distinct.
+        let mut a = spool_event("ab", "/etc/c");
+        let mut b = spool_event("a", "/etc/bc");
+        a.event_type = "X".to_string();
+        b.event_type = "X".to_string();
+
+        let mac_a = compute_event_hmac_for(TEST_KEY, CHAIN_GENESIS_HMAC, &a);
+        let mac_b = compute_event_hmac_for(TEST_KEY, CHAIN_GENESIS_HMAC, &b);
+        assert_ne!(
+            mac_a, mac_b,
+            "field boundaries are not unambiguously encoded in the MAC input"
+        );
+    }
+
+    #[test]
+    fn test_absent_and_empty_optional_fields_differ() {
+        let mut absent = spool_event("e", "/etc/f");
+        absent.whodata_comm = None;
+        let mut empty = spool_event("e", "/etc/f");
+        empty.whodata_comm = Some(String::new());
+
+        assert_ne!(
+            compute_event_hmac_for(TEST_KEY, CHAIN_GENESIS_HMAC, &absent),
+            compute_event_hmac_for(TEST_KEY, CHAIN_GENESIS_HMAC, &empty),
+            "an absent optional field must not hash the same as an empty one"
+        );
+    }
+
+    #[test]
+    fn test_reordering_two_events_breaks_the_chain() {
+        let db = seeded_db(3);
+        db.connection()
+            .execute(
+                "UPDATE event_spool SET path = CASE sequence_id
+                     WHEN 1 THEN (SELECT path FROM event_spool WHERE sequence_id = 2)
+                     WHEN 2 THEN (SELECT path FROM event_spool WHERE sequence_id = 1)
+                     ELSE path END
+                 WHERE sequence_id IN (1, 2)",
+                [],
+            )
+            .unwrap();
+        assert!(!db.verify_spool_chain(TEST_KEY).unwrap().is_valid);
+    }
+
+    #[test]
+    fn test_append_returns_and_records_sequence_id() {
+        let db = BaselineDb::open_in_memory().unwrap();
+        let mut ev = spool_event("evt-1", "/etc/passwd");
+        let seq = db.append_spool_event_chained(&mut ev, TEST_KEY).unwrap();
+        assert_eq!(seq, 1);
+        assert_eq!(ev.sequence_id, Some(1), "the event should carry its assigned sequence id");
+        assert_eq!(db.count_spool_events().unwrap(), 1);
+    }
+
+    // ---------------- Diff scoping ----------------
+
+    #[test]
+    fn test_diff_scope_does_not_match_sibling_prefix() {
+        // Regression guard: a bare starts_with test let a scope of "/etc" pull in
+        // "/etcetera/...", reporting unrelated files as deleted.
+        let db = BaselineDb::open_in_memory().unwrap();
+        db.insert_entry(&dummy_file("/etc/passwd", &"a".repeat(64), 10, 0o644), "v1")
+            .unwrap();
+        db.insert_entry(
+            &dummy_file("/etcetera/other.conf", &"b".repeat(64), 10, 0o644),
+            "v1",
+        )
+        .unwrap();
+
+        // Nothing observed on disk, scoped to /etc.
+        let diff = db
+            .diff_filesystem_scoped(&[], Some(Path::new("/etc")))
+            .unwrap();
+
+        let removed: Vec<String> = diff
+            .removed
+            .iter()
+            .map(|m| normalize_path_str(&m.path))
+            .collect();
+
+        assert!(removed.contains(&"/etc/passwd".to_string()));
+        assert!(
+            !removed.contains(&"/etcetera/other.conf".to_string()),
+            "a sibling path sharing a textual prefix was pulled into the scope: {:?}",
+            removed
+        );
+    }
+
+    #[test]
+    fn test_diff_scope_includes_the_root_itself() {
+        let db = BaselineDb::open_in_memory().unwrap();
+        db.insert_entry(&dummy_file("/etc", &"0".repeat(64), 0, 0o755), "v1")
+            .unwrap();
+        let diff = db
+            .diff_filesystem_scoped(&[], Some(Path::new("/etc")))
+            .unwrap();
+        assert_eq!(diff.removed.len(), 1);
+    }
+
+    #[test]
+    fn test_insert_batch_reports_rows_written() {
+        let mut db = BaselineDb::open_in_memory().unwrap();
+        let entries = vec![
+            dummy_file("/a", &"1".repeat(64), 1, 0o644),
+            dummy_file("/b", &"2".repeat(64), 2, 0o644),
+            dummy_file("/c", &"3".repeat(64), 3, 0o644),
+        ];
+        assert_eq!(db.insert_batch(&entries, "v1").unwrap(), 3);
+        assert_eq!(db.count_entries().unwrap(), 3);
     }
 }

@@ -24,5 +24,15 @@ hmac = "0.12"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2.169"
 
+[target.'cfg(windows)'.dependencies]
+# GetFileInformationByHandle is required for genuine NTFS file identity (volume serial
+# number + 64-bit file index + hard link count). The std equivalents
+# (Metadata::volume_serial_number / file_index / number_of_links) are still gated behind
+# the unstable `windows_by_handle` feature, so they cannot be used on stable Rust.
+windows-sys = { version = "0.61.2", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true

@@ -1,8 +1,106 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 use openfim_common::{BaselineDb, FileMetadata, HashAlgorithm, Policy, StreamHasher, TokenBucket};
 
 mod console;
+
+/// Writes sensitive key material with owner-only permissions.
+///
+/// On Unix the file is created with mode 0600 so that the default umask cannot leave
+/// a signing key group- or world-readable. On Windows the file inherits the
+/// directory ACL, which is noted in the CLI output so the operator can protect it.
+pub(crate) fn write_secret_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)?;
+        f.write_all(bytes)?;
+        f.sync_all()
+    }
+
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, bytes)
+    }
+}
+
+/// Renders a `st_mode` value using the right vocabulary for the platform.
+///
+/// On Unix this is a POSIX permission mode and octal is the natural form. On Windows
+/// the same field holds Win32 attribute flags, where an octal rendering like `0o40`
+/// reads as a nonsensical permission set (it is in fact FILE_ATTRIBUTE_ARCHIVE).
+pub(crate) fn format_mode(mode: u32) -> String {
+    if openfim_common::posix_mode_supported() {
+        format!("0o{:o}", mode)
+    } else {
+        let mut flags = Vec::new();
+        for (bit, name) in [
+            (0x1u32, "READONLY"),
+            (0x2, "HIDDEN"),
+            (0x4, "SYSTEM"),
+            (0x10, "DIRECTORY"),
+            (0x20, "ARCHIVE"),
+            (0x80, "NORMAL"),
+            (0x100, "TEMPORARY"),
+            (0x400, "REPARSE_POINT"),
+            (0x800, "COMPRESSED"),
+            (0x4000, "ENCRYPTED"),
+        ] {
+            if mode & bit != 0 {
+                flags.push(name);
+            }
+        }
+        if flags.is_empty() {
+            format!("0x{:x} (Win32 attributes)", mode)
+        } else {
+            format!("0x{:x} (Win32 attributes: {})", mode, flags.join(" | "))
+        }
+    }
+}
+
+/// Converts a MB/s setting into bytes per second without overflowing.
+///
+/// A plain `mb_s * 1024 * 1024` wraps for large inputs, which in release builds turns
+/// a deliberately huge limit into a very small one and throttles the scan to a crawl.
+pub(crate) fn rate_bytes_per_sec(mb_s: u64) -> u64 {
+    mb_s.saturating_mul(1024).saturating_mul(1024)
+}
+
+/// Resolves an HMAC key from an explicit value, a file, or the environment.
+///
+/// Prefers the environment and files over a command-line value, because arguments are
+/// visible to any local user through the process table.
+pub(crate) fn resolve_audit_key(
+    explicit: Option<&str>,
+    key_file: Option<&Path>,
+) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    if let Some(path) = key_file {
+        let raw = std::fs::read_to_string(path)?;
+        let trimmed = raw.trim();
+        if trimmed.is_empty() {
+            return Err(format!("HMAC key file {} is empty", path.display()).into());
+        }
+        return Ok(trimmed.as_bytes().to_vec());
+    }
+    if let Some(k) = explicit.map(str::trim).filter(|k| !k.is_empty()) {
+        return Ok(k.as_bytes().to_vec());
+    }
+    if let Ok(env_key) = std::env::var("OPENFIM_HMAC_KEY") {
+        let trimmed = env_key.trim();
+        if !trimmed.is_empty() {
+            return Ok(trimmed.as_bytes().to_vec());
+        }
+    }
+    Err("No HMAC key supplied. Set OPENFIM_HMAC_KEY, or pass --key-file <PATH>. \
+         The audit chain cannot be verified without the key it was signed with."
+        .into())
+}
 
 #[derive(Parser, Debug)]
 #[command(
@@ -109,9 +207,18 @@ pub enum AuditAction {
         #[arg(short, long, default_value = "openfim.db")]
         db: PathBuf,
 
-        /// Secret key for HMAC-SHA256 verification
-        #[arg(short, long, default_value = "openfim-sensor-secret-key")]
-        key: String,
+        /// Secret key for HMAC-SHA256 verification.
+        ///
+        /// Prefer OPENFIM_HMAC_KEY or --key-file: a key passed as an argument is
+        /// visible to every local user through the process table. There is no
+        /// default, because a built-in key would make the chain forgeable by anyone
+        /// holding the binary.
+        #[arg(short, long, env = "OPENFIM_HMAC_KEY", hide_env_values = true)]
+        key: Option<String>,
+
+        /// Read the HMAC verification key from a file
+        #[arg(long, conflicts_with = "key")]
+        key_file: Option<PathBuf>,
     },
 }
 
@@ -281,7 +388,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(ref m) = current_meta {
                 println!("File Status:         PRESENT ON DISK");
                 println!("File Size:           {} bytes", m.st_size);
-                println!("Permissions / Mode:  0o{:o}", m.st_mode);
+                println!("Permissions / Mode:  {}", format_mode(m.st_mode));
                 println!("Last Modified Time:  Unix timestamp {} (ctime: {})", m.st_mtime, m.st_ctime);
                 println!("Computed SHA-256:    {}", m.sha256);
                 if let Some(ref b3) = m.blake3 {
@@ -322,7 +429,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("    Baseline Status: REGISTERED IN BASELINE");
                                 println!("    Baseline Size:   {} bytes", baseline.st_size);
                                 println!("    Baseline SHA256: {}", baseline.sha256);
-                                println!("    Baseline Mode:   0o{:o}", baseline.st_mode);
+                                println!("    Baseline Mode:   {}", format_mode(baseline.st_mode));
 
                                 if let Some(ref cur) = current_meta {
                                     let hash_match = cur.sha256 == baseline.sha256;
@@ -339,8 +446,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                         }
                                         if !meta_match {
                                             println!("      -> Metadata Divergence: Permissions/ownership changed!");
-                                            println!("         Expected Mode: 0o{:o}, UID: {}", baseline.st_mode, baseline.st_uid);
-                                            println!("         Current Mode:  0o{:o}, UID: {}", cur.st_mode, cur.st_uid);
+                                            println!("         Expected Mode: {}, UID: {}", format_mode(baseline.st_mode), baseline.st_uid);
+                                            println!("         Current Mode:  {}, UID: {}", format_mode(cur.st_mode), cur.st_uid);
                                         }
                                     }
                                 } else {
@@ -451,7 +558,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             throttle_mb_s,
         } => {
             let algo = algorithm.parse::<HashAlgorithm>()?;
-            let rate_bytes = throttle_mb_s * 1024 * 1024;
+            let rate_bytes = rate_bytes_per_sec(throttle_mb_s);
             let mut hasher = StreamHasher::new(algo, TokenBucket::new(rate_bytes));
 
             let result = hasher.hash_file(&path)?;
@@ -471,12 +578,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             throttle_mb_s,
         } => {
             use openfim_common::{CrawlOptions, FileCrawler};
-            let rate_bytes = throttle_mb_s * 1024 * 1024;
-            let mut hasher = StreamHasher::new(HashAlgorithm::Sha256, TokenBucket::new(rate_bytes));
+            let mut hasher = StreamHasher::new(
+                HashAlgorithm::Sha256,
+                TokenBucket::new(rate_bytes_per_sec(throttle_mb_s)),
+            );
 
-            let mut options = CrawlOptions::default();
-            options.max_depth = max_depth;
-            options = options.with_ignore_patterns(ignore)?;
+            let options = CrawlOptions::default()
+                .with_max_depth(max_depth)
+                .with_ignore_patterns(ignore)?;
 
             let crawler = FileCrawler::new(options);
             println!("[*] Starting crawl on: {}", path.display());
@@ -652,18 +761,29 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                     println!("[+] Generated fresh Ed25519 administrative keypair:");
                     println!("Public Key  (hex): {}", pub_hex);
-                    println!("Private Key (hex): {}", priv_hex);
 
-                    if let Some(dir) = out_dir {
-                        std::fs::create_dir_all(&dir)?;
-                        let pub_file = dir.join("openfim_admin.pub");
-                        let key_file = dir.join("openfim_admin.key");
-                        std::fs::write(&pub_file, pub_hex.as_bytes())?;
-                        std::fs::write(&key_file, priv_hex.as_bytes())?;
-                        println!("[+] Keys saved to:");
-                        println!("  - {}", pub_file.display());
-                        println!("  - {}", key_file.display());
-                    }
+                    // The private key is deliberately NOT printed.
+                    //
+                    // Writing a signing key to stdout leaks it into shell history,
+                    // terminal scrollback, CI job logs and anything capturing output.
+                    // This key authorizes every policy the fleet will trust, so it is
+                    // written only to a file with owner-only permissions.
+                    let dir = out_dir.unwrap_or_else(|| PathBuf::from("."));
+                    std::fs::create_dir_all(&dir)?;
+                    let pub_file = dir.join("openfim_admin.pub");
+                    let key_file = dir.join("openfim_admin.key");
+
+                    std::fs::write(&pub_file, pub_hex.as_bytes())?;
+                    write_secret_file(&key_file, priv_hex.as_bytes())?;
+
+                    println!("[+] Keys saved to:");
+                    println!("  - {} (public)", pub_file.display());
+                    println!("  - {} (PRIVATE - keep offline)", key_file.display());
+                    println!(
+                        "[i] The private key was written to disk only, never to this terminal.\n    \
+                         Move it to protected offline storage; anything able to read it can sign \
+                         policies your whole fleet will trust."
+                    );
                 }
 
                 PolicyAction::Sign {
@@ -723,10 +843,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Audit { action } => match action {
-            AuditAction::Verify { db, key } => {
+            AuditAction::Verify { db, key, key_file } => {
                 println!("[*] Auditing tamper-evident HMAC offline log: {}", db.display());
+                let audit_key = resolve_audit_key(key.as_deref(), key_file.as_deref())?;
                 let baseline_db = BaselineDb::open(&db)?;
-                let report = baseline_db.verify_spool_chain(key.as_bytes())?;
+                let report = baseline_db.verify_spool_chain(&audit_key)?;
                 if report.is_valid {
                     println!("\n============================================================");
                     println!("  [✓] AUDIT PASSED: Tamper-Evident HMAC Chain is VALID      ");
