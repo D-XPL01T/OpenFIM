@@ -9,6 +9,13 @@ resolver = "2"
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+# Minimum supported Rust version, enforced by a dedicated CI job.
+#
+# The floor is set by the dependency tree rather than by this crate's own code:
+# `clap_lex` is published with edition2024, which requires a Cargo that can parse it,
+# and edition2024 stabilized in 1.85. Attempting the build on 1.82 fails at the
+# download step with "requires the Cargo feature called `edition2024`".
+rust-version = "1.85"
 authors = ["OpenFIM Security Architecture Team"]
 license = "Apache-2.0"
 

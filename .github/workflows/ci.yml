@@ -1,0 +1,178 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# A newer push to the same ref makes the in-flight run redundant.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least privilege: nothing here needs to write to the repository.
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Incremental artifacts are pure overhead in a fresh container.
+  CARGO_INCREMENTAL: 0
+  # Fail fast on a network hiccup instead of hanging the job.
+  CARGO_NET_RETRY: 3
+
+# Toolchains are installed with the preinstalled `rustup` rather than a third-party
+# action, so the only external actions in this workflow are checkout and the cache.
+# SHA-pinning those two is tracked as supply-chain hardening in
+# docs/18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md (items 3.2 and 3.5).
+
+jobs:
+  format:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # Keeps the MSRV asserted in Cargo.toml and the version actually exercised by the
+  # test matrix from drifting apart, which would leave that leg silently testing
+  # something other than the advertised minimum.
+  msrv-declared:
+    name: MSRV declaration matches CI
+    runs-on: ubuntu-latest
+    env:
+      CI_MSRV: "1.85"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare Cargo.toml rust-version against the tested toolchain
+        run: |
+          declared=$(grep -m1 '^rust-version' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          echo "Cargo.toml declares: ${declared}"
+          echo "CI exercises:        ${CI_MSRV}"
+          if [ "${declared}" != "${CI_MSRV}" ]; then
+            echo "::error file=Cargo.toml::rust-version (${declared}) does not match the MSRV tested in CI (${CI_MSRV}). Update both together."
+            exit 1
+          fi
+
+  clippy:
+    name: clippy (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component clippy
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      # --all-targets covers tests too, where plenty of lint-worthy code lives.
+      # -D warnings is applied here rather than through a global RUSTFLAGS so that
+      # the MSRV leg is not failed by a lint an older compiler happens to emit.
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: test (${{ matrix.os }}, ${{ matrix.rust }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        rust: [stable]
+        include:
+          # MSRV is checked on Linux only. It guards against adopting a newer language
+          # or std feature, which is not platform-specific, so paying for it three
+          # times buys nothing.
+          - os: ubuntu-latest
+            rust: "1.85.0"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install ${{ matrix.rust }} --profile minimal
+          rustup default ${{ matrix.rust }}
+          rustc --version
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build --workspace --all-targets
+      - name: Test
+        run: cargo test --workspace
+
+  # The integrity guarantees are implemented differently per platform —
+  # (st_dev, st_ino) on Unix versus the NTFS volume serial plus file index on Windows —
+  # so the tests that prove them are surfaced as named steps. A green aggregate "test"
+  # job would not show which security property was actually verified where.
+  integrity-guarantees:
+    name: integrity guarantees (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Filesystem identity is real, not derived from mutable attributes
+        run: cargo test -p openfim-common --lib fsident
+      - name: TOCTOU substitution detection and hash correctness
+        run: cargo test -p openfim-common --lib hasher
+      - name: Audit chain detects edits, interior deletion and tail truncation
+        run: cargo test -p openfim-common --lib db::tests
+      - name: Active response cannot destroy the data it protects
+        run: cargo test -p openfim-common --lib policy::tests
+      - name: Backup store resists filename collisions and corruption
+        run: cargo test -p openfim-common --lib backup
+      - name: Red-team evasion suite
+        run: cargo test -p openfim-common --test pipeline_tests
+
+  release-build:
+    name: release build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - uses: Swatinem/rust-cache@v2
+      # Release codegen differs from debug (notably, no overflow checks), so a
+      # debug-only CI can miss real breakage.
+      - name: Build release
+        run: cargo build --workspace --release
+
+  ci-success:
+    name: CI
+    if: always()
+    needs: [format, msrv-declared, clippy, test, integrity-guarantees, release-build]
+    runs-on: ubuntu-latest
+    steps:
+      # One stable check name to require in branch protection. Without this, adding a
+      # matrix leg later would quietly not be required to pass.
+      - name: Verify every job succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+        run: |
+          echo "${NEEDS}"
+          if printf '%s' "${NEEDS}" | grep -qE '"result"[[:space:]]*:[[:space:]]*"(failure|cancelled)"'; then
+            echo "::error::One or more CI jobs did not succeed."
+            exit 1
+          fi
+          echo "All CI jobs succeeded."
