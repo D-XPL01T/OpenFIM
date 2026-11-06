@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -9,9 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use openfim_common::notify::{self, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use openfim_common::{
-    BackupStore, BaselineDb, CompiledPolicy, FileMetadata, HashAlgorithm, Policy, PolicyRule,
-    PolicyVerifier, ProcessContext, RemediationGuard, SpoolEvent, StreamHasher, TokenBucket,
-    DEFAULT_MAX_REMEDIATIONS_PER_HOUR,
+    evaluate, support_for, BackupStore, BaselineDb, ChangeKind, ChangeSet, Check, CompiledPolicy,
+    FileMetadata, HashAlgorithm, Policy, PolicyRule, PolicyVerifier, ProcessContext,
+    RemediationGuard, SpoolEvent, StreamHasher, TokenBucket, DEFAULT_MAX_REMEDIATIONS_PER_HOUR,
 };
 
 /// Debounce window for coalescing multi-stage editor writes.
@@ -57,9 +57,13 @@ struct Args {
     #[arg(long)]
     inspect: Option<PathBuf>,
 
-    /// Maximum I/O read rate in MB/s (0 = unlimited)
-    #[arg(long, default_value_t = 20)]
-    throttle_mb_s: u64,
+    /// Maximum I/O read rate in MB/s (0 = unlimited).
+    ///
+    /// Overrides `globals.max_io_rate_mb_s` in the policy. Left unset, the policy's
+    /// value is used — previously this flag was the only thing that had any effect and
+    /// the policy setting was silently ignored.
+    #[arg(long)]
+    throttle_mb_s: Option<u64>,
 
     /// Enable automated active response remediation (quarantine / rollback)
     #[arg(long)]
@@ -118,7 +122,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
         let mut hasher = StreamHasher::new(
             HashAlgorithm::Sha256,
-            TokenBucket::new(rate_bytes_per_sec(args.throttle_mb_s)),
+            TokenBucket::new(rate_bytes_per_sec(args.throttle_mb_s.unwrap_or(20))),
         );
         match FileMetadata::extract(target_path, &mut hasher) {
             Ok(meta) => println!("{}", serde_json::to_string_pretty(&meta)?),
@@ -228,6 +232,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    // Resolve the scanner settings the policy asks for. Until now `default_hash`,
+    // `max_io_rate_mb_s` and `scan_nice_priority` were parsed and then ignored.
+    let settings = policy.effective_scan_settings(args.throttle_mb_s);
+    println!(
+        "[*] Hash algorithm:    {:?} (from {})",
+        settings.hash_algorithm.value, settings.hash_algorithm.source
+    );
+    println!(
+        "[*] I/O rate limit:    {}",
+        if settings.max_io_rate_mb_s.value == 0 {
+            format!("unlimited (from {})", settings.max_io_rate_mb_s.source)
+        } else {
+            format!(
+                "{} MB/s (from {})",
+                settings.max_io_rate_mb_s.value, settings.max_io_rate_mb_s.source
+            )
+        }
+    );
+
+    match openfim_common::policy::apply_scan_priority(settings.scan_nice_priority.value) {
+        Ok(()) => println!(
+            "[*] Scan priority:     {} (from {})",
+            settings.scan_nice_priority.value, settings.scan_nice_priority.source
+        ),
+        // Report rather than swallow: lowering priority needs privilege on Unix, and an
+        // operator who configured it deserves to know it did not take effect.
+        Err(e) => println!(
+            "[!] Scan priority {} could not be applied: {}. Scanning continues at the \
+             default priority.",
+            settings.scan_nice_priority.value, e
+        ),
+    }
+
+    // Report unenforceable controls once, at startup, rather than on every event.
+    //
+    // The operator needs to learn that a control they configured does nothing *before*
+    // an incident, not while reading an alert that quietly omitted it.
+    report_unenforceable_checks(&policy);
+
     if !ProcessContext::attribution_available() {
         println!(
             "[!] Process attribution: UNAVAILABLE on this build. Alerts will record the \
@@ -309,7 +352,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let loop_cfg = SensorConfig {
-        rate_bytes: rate_bytes_per_sec(args.throttle_mb_s),
+        rate_bytes: settings.rate_bytes_per_sec(),
+        hash_algorithm: settings.hash_algorithm.value,
         remediation: args.remediation,
         backup: backup_store,
         hmac_key,
@@ -329,6 +373,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 struct SensorConfig {
     rate_bytes: u64,
+    /// Algorithm the policy asked for, rather than a hardcoded SHA-256.
+    hash_algorithm: HashAlgorithm,
     remediation: bool,
     /// Opened once at startup rather than per event: the store parses its index from
     /// disk, which has no business happening inside the hot path.
@@ -411,7 +457,7 @@ fn handle_path_event(
     let exists = path.exists();
 
     if exists && path.is_file() {
-        let mut hasher = StreamHasher::new(HashAlgorithm::Sha256, TokenBucket::new(cfg.rate_bytes));
+        let mut hasher = StreamHasher::new(cfg.hash_algorithm, TokenBucket::new(cfg.rate_bytes));
         let current_meta = match FileMetadata::extract(path, &mut hasher) {
             Ok(m) => m,
             Err(e) => {
@@ -428,48 +474,28 @@ fn handle_path_event(
 
         match db.get_entry(path) {
             Ok(Some(baseline_entry)) => {
-                if rule.checks.hash && baseline_entry.sha256 != current_meta.sha256 {
-                    print_alert(
-                        "CRITICAL",
-                        "CONTENT_MUTATED",
-                        path,
-                        rule.severity,
-                        &whodata,
-                        Some(&baseline_entry.sha256),
-                        Some(&current_meta.sha256),
-                    );
-                    let mut spool = create_spool_event(
-                        "CONTENT_MUTATED",
-                        path,
-                        rule.severity,
-                        &whodata,
-                        ts_nano,
-                        Some(baseline_entry.sha256),
-                        Some(current_meta.sha256),
-                    );
-                    record_event(db, &mut spool, &cfg.hmac_key);
-                    apply_remediation(path, rule, guard, cfg);
-                } else if rule.checks.permissions && baseline_entry.st_mode != current_meta.st_mode
-                {
-                    print_alert(
-                        "HIGH",
-                        "METADATA_MUTATED",
-                        path,
-                        rule.severity,
-                        &whodata,
-                        None,
-                        None,
-                    );
-                    let mut spool = create_spool_event(
-                        "METADATA_MUTATED",
-                        path,
-                        rule.severity,
-                        &whodata,
-                        ts_nano,
-                        None,
-                        None,
-                    );
-                    record_event(db, &mut spool, &cfg.hmac_key);
+                // One engine decides what changed, for every check the rule enables.
+                // The daemon used to compare only `hash` and then `permissions`
+                // inline, which left five of the seven checks inert.
+                let changes = evaluate(&baseline_entry, &current_meta, &rule.checks);
+
+                if !changes.is_clean() {
+                    print_change_alert(path, rule.severity, &whodata, &changes);
+
+                    // Every observed difference is recorded separately, so the audit
+                    // trail shows which controls fired rather than collapsing a
+                    // content change and a permission change into one vague event.
+                    for change in &changes.changes {
+                        let mut spool =
+                            create_spool_event_for(change, path, rule.severity, &whodata, ts_nano);
+                        record_event(db, &mut spool, &cfg.hmac_key);
+                    }
+
+                    // Rollback is for content and object substitution. A timestamp or
+                    // ownership edit alone does not justify overwriting the live file.
+                    if changes.is_substantive() {
+                        apply_remediation(path, rule, guard, cfg, db);
+                    }
                 }
             }
             Ok(None) => {
@@ -521,7 +547,7 @@ fn handle_path_event(
                     None,
                 );
                 record_event(db, &mut spool, &cfg.hmac_key);
-                apply_remediation(path, rule, guard, cfg);
+                apply_remediation(path, rule, guard, cfg, db);
             }
             Ok(None) => {}
             Err(e) => {
@@ -548,13 +574,69 @@ fn apply_remediation(
     rule: &PolicyRule,
     guard: &mut RemediationGuard,
     cfg: &SensorConfig,
+    db: &BaselineDb,
 ) {
     if !cfg.remediation {
         return;
     }
     match guard.execute(rule.active_response.action, path, cfg.backup.as_ref()) {
-        Ok(outcome) => println!("    [REMEDIATION] {}", outcome),
+        Ok(outcome) => {
+            println!("    [REMEDIATION] {}", outcome);
+            if outcome.was_applied() {
+                reanchor_after_restore(path, cfg, db);
+            }
+        }
         Err(e) => eprintln!("    [REMEDIATION] failed: {}", e),
+    }
+}
+
+/// After a verified restore, record the restored object's identity as the baseline's.
+///
+/// An atomic restore stages content beside the target and renames it into place, which
+/// is what stops the live path being observed half-written — but it also means the file
+/// now has a different inode (NTFS file index on Windows) than the baseline recorded.
+/// Without this, the identity check reports `FILE_REPLACED` on the very next event, so
+/// the defensive action would raise an alert about its own work.
+///
+/// Re-anchoring is gated on the content digest still matching the baseline, so a
+/// tampered file can never be blessed this way.
+fn reanchor_after_restore(path: &Path, cfg: &SensorConfig, db: &BaselineDb) {
+    let mut hasher = StreamHasher::new(cfg.hash_algorithm, TokenBucket::new(cfg.rate_bytes));
+    let restored = match FileMetadata::extract(path, &mut hasher) {
+        Ok(m) => m,
+        Err(e) => {
+            eprintln!(
+                "    [!] Restored {} but could not re-read it to re-anchor the baseline: {}",
+                path.display(),
+                e
+            );
+            return;
+        }
+    };
+
+    match db.reanchor_entry_identity(path, &restored) {
+        Ok(true) => {}
+        Ok(false) => eprintln!(
+            "    [!] Restored {} but its content does not match the baseline digest, so \
+             the baseline identity was left unchanged. Investigate: the backup store may \
+             hold content that was never the approved baseline.",
+            path.display()
+        ),
+        Err(e) => eprintln!(
+            "    [!] Could not re-anchor the baseline identity for {}: {}",
+            path.display(),
+            e
+        ),
+    }
+}
+
+/// Maps a change's rank onto an operator-facing severity label.
+fn level_for(change: &ChangeKind) -> &'static str {
+    match change.rank() {
+        r if r >= 90 => "CRITICAL",
+        r if r >= 60 => "HIGH",
+        r if r >= 40 => "MEDIUM",
+        _ => "LOW",
     }
 }
 
@@ -577,10 +659,44 @@ fn print_alert(
     if let Some(nh) = new_hash {
         println!("    New SHA256: {}", nh);
     }
+    print_whodata(who);
+    println!("    Timestamp:  {}", unix_now_secs());
+    println!("======================================================================");
+}
 
-    // State plainly whether the acting process is known. Printing the sensor's own
-    // PID under an "actor" label would put a false attribution into the operator's
-    // hands and into the audit trail.
+/// Alert covering every difference the detection engine found for one path.
+fn print_change_alert(path: &Path, severity: u32, who: &ProcessContext, changes: &ChangeSet) {
+    let headline = match changes.most_severe() {
+        Some(c) => c,
+        None => return,
+    };
+
+    println!("\n[!] ==================== OPENFIM INTEGRITY ALERT ====================");
+    println!(
+        "    Level:      {} (Severity: {}/10)",
+        level_for(headline),
+        severity
+    );
+    println!("    Event:      {}", headline.event_type());
+    println!("    Path:       {}", path.display());
+
+    println!("    Changes:    {} detected", changes.len());
+    let mut ordered: Vec<&ChangeKind> = changes.changes.iter().collect();
+    ordered.sort_by_key(|c| std::cmp::Reverse(c.rank()));
+    for change in ordered {
+        println!("      - [{}] {}", change.event_type(), change.describe());
+    }
+
+    print_whodata(who);
+    println!("    Timestamp:  {}", unix_now_secs());
+    println!("======================================================================");
+}
+
+/// State plainly whether the acting process is known.
+///
+/// Printing the sensor's own PID under an "actor" label would put a false attribution
+/// into the operator's hands and into the audit trail.
+fn print_whodata(who: &ProcessContext) {
     if who.is_attributed {
         println!(
             "    Who-Data:   PID={} Comm={:?} Exe={:?} Cmdline={:?}",
@@ -590,8 +706,95 @@ fn print_alert(
         println!("    Who-Data:   UNATTRIBUTED - the writing process could not be identified");
         println!("                (kernel-level attribution is required and unavailable here)");
     }
-    println!("    Timestamp:  {}", unix_now_secs());
-    println!("======================================================================");
+}
+
+/// Warns about every check the policy enables that this platform cannot perform.
+///
+/// Silence here is what produces false assurance: a rule with `ownership: true` on
+/// Windows loads, validates, and displays as active while comparing two fields that
+/// are both hardcoded to zero.
+fn report_unenforceable_checks(policy: &Policy) {
+    use std::collections::BTreeSet;
+
+    let mut offenders: BTreeSet<(&'static str, &'static str)> = BTreeSet::new();
+
+    for rule in &policy.rules {
+        for check in Check::ALL {
+            let requested = match check {
+                Check::Hash => rule.checks.hash,
+                Check::Size => rule.checks.size,
+                Check::Permissions => rule.checks.permissions,
+                Check::Ownership => rule.checks.ownership,
+                Check::Timestamps => rule.checks.timestamps,
+                Check::Attributes => rule.checks.attributes,
+                Check::Xattrs => rule.checks.xattrs,
+            };
+            if !requested {
+                continue;
+            }
+            let support = support_for(check);
+            if !support.is_active() {
+                offenders.insert((
+                    check.field_name(),
+                    support.note().unwrap_or("unsupported in this build"),
+                ));
+            }
+        }
+    }
+
+    if offenders.is_empty() {
+        return;
+    }
+
+    println!(
+        "[!] {} of the checks this policy enables cannot be enforced on {}:",
+        offenders.len(),
+        openfim_common::platform_name()
+    );
+    for (field, reason) in &offenders {
+        println!("      - {}: {}", field, reason);
+    }
+    println!(
+        "    These are reported as skipped rather than silently passing. \
+         Run `openfim-cli policy lint` for the full picture."
+    );
+}
+
+/// Monotonic discriminator for event ids.
+///
+/// `event_id` is UNIQUE in the spool schema, and a single filesystem change can now
+/// produce several events in the same nanosecond — a content edit and a permission
+/// edit, say. Deriving the id from the timestamp alone made those collide, and the
+/// second insert would fail, silently dropping a real event from the audit chain.
+static EVENT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_event_id(ts_nano: i64) -> String {
+    let n = EVENT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("evt-{}-{}", ts_nano, n)
+}
+
+/// Builds a spool event for one detected change, carrying its digests where it has them.
+fn create_spool_event_for(
+    change: &ChangeKind,
+    path: &Path,
+    severity: u32,
+    who: &ProcessContext,
+    ts_nano: i64,
+) -> SpoolEvent {
+    let (old, new) = change.hashes();
+    let mut event = create_spool_event(
+        change.event_type(),
+        path,
+        severity,
+        who,
+        ts_nano,
+        old.map(str::to_string),
+        new.map(str::to_string),
+    );
+    // Record the human-readable description of this specific change. It is
+    // authenticated by the event MAC, so it cannot be rewritten after the fact.
+    event.diff_snippet = Some(change.describe());
+    event
 }
 
 fn create_spool_event(
@@ -610,7 +813,7 @@ fn create_spool_event(
 
     SpoolEvent {
         sequence_id: None,
-        event_id: format!("evt-{}", ts_nano),
+        event_id: next_event_id(ts_nano),
         timestamp_nano: ts_nano,
         event_type: event_type.to_string(),
         path: openfim_common::normalize_path_str(path),
@@ -660,7 +863,7 @@ mod tests {
             hmac_key: hmac_key.map(|s| s.to_string()),
             hmac_key_file: file,
             inspect: None,
-            throttle_mb_s: 20,
+            throttle_mb_s: None,
             remediation: false,
             max_remediations_per_hour: 3,
             backup_dir: None,

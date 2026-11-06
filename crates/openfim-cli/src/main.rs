@@ -356,6 +356,25 @@ pub enum PolicyAction {
         out: Option<PathBuf>,
     },
 
+    /// Lint a policy for configuration that parses but will not do what it says
+    Lint {
+        /// Policy YAML file to lint
+        #[arg(short, long)]
+        policy: PathBuf,
+
+        /// Do not probe the filesystem for path existence. Use when linting a policy
+        /// written for a different host, where absent paths are expected.
+        #[arg(long)]
+        no_fs_check: bool,
+
+        /// Also report informational findings
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// Show which integrity checks this build can enforce on this platform
+    Capabilities,
+
     /// Test a specific file path against policy rules to inspect matching and severity
     TestPath {
         /// Target policy YAML file
@@ -396,6 +415,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let exists = path.exists();
             let mut hasher = StreamHasher::default_sha256();
+
+            // Resolve which checks apply before comparing anything, so the baseline
+            // comparison below honours the operator's policy rather than a hardcoded
+            // subset. `None` means no policy governs this path, in which case the
+            // schema defaults apply.
+            let pol_path = policy.clone().or_else(|| {
+                let default_p = PathBuf::from("policy.yaml");
+                if default_p.exists() {
+                    Some(default_p)
+                } else {
+                    None
+                }
+            });
+            let resolved_checks: Option<openfim_common::RuleChecks> =
+                pol_path.as_ref().and_then(|p| {
+                    Policy::from_yaml_file(p)
+                        .ok()
+                        .and_then(|pol| pol.find_matching_rule(&path).map(|r| r.checks.clone()))
+                });
 
             // 1. Physical inspection & cryptographic hashing
             let current_meta = if exists && path.is_file() {
@@ -468,31 +506,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 println!("    Baseline Mode:   {}", format_mode(baseline.st_mode));
 
                                 if let Some(ref cur) = current_meta {
-                                    let hash_match = cur.sha256 == baseline.sha256;
-                                    let meta_match = cur.st_mode == baseline.st_mode
-                                        && cur.st_uid == baseline.st_uid;
+                                    // Routed through the shared detection engine, so the
+                                    // CLI's verdict cannot disagree with the daemon's.
+                                    // This block previously compared only the hash plus
+                                    // st_mode and st_uid — a third hand-rolled copy of
+                                    // the same security decision.
+                                    let checks = resolved_checks.clone().unwrap_or_default();
+                                    let changes = openfim_common::evaluate(&baseline, cur, &checks);
 
-                                    if hash_match && meta_match {
+                                    if changes.is_clean() {
                                         println!("    INTEGRITY CHECK: [✓] CLEAN & UNCOMPROMISED (Matches baseline snapshot)");
                                     } else {
                                         println!("    INTEGRITY CHECK: [!] TAMPERING / MODIFICATION DETECTED!");
-                                        if !hash_match {
-                                            println!("      -> Content Divergence: Hash modified since baseline snapshot!");
-                                            println!("         Expected: {}", baseline.sha256);
-                                            println!("         Current:  {}", cur.sha256);
+                                        let mut ordered: Vec<_> = changes.changes.iter().collect();
+                                        ordered.sort_by_key(|c| std::cmp::Reverse(c.rank()));
+                                        for change in ordered {
+                                            println!(
+                                                "      -> [{}] {}",
+                                                change.event_type(),
+                                                change.describe()
+                                            );
                                         }
-                                        if !meta_match {
-                                            println!("      -> Metadata Divergence: Permissions/ownership changed!");
-                                            println!(
-                                                "         Expected Mode: {}, UID: {}",
-                                                format_mode(baseline.st_mode),
-                                                baseline.st_uid
-                                            );
-                                            println!(
-                                                "         Current Mode:  {}, UID: {}",
-                                                format_mode(cur.st_mode),
-                                                cur.st_uid
-                                            );
+                                    }
+
+                                    // An uncomparable field is an unknown, not a pass.
+                                    if !changes.skipped_unsupported.is_empty() {
+                                        println!(
+                                            "    CHECKS SKIPPED:  {} requested check(s) cannot be enforced on {}:",
+                                            changes.skipped_unsupported.len(),
+                                            openfim_common::platform_name()
+                                        );
+                                        for skip in &changes.skipped_unsupported {
+                                            println!("      -> {}: {}", skip.check, skip.reason);
                                         }
                                     }
                                 } else {
@@ -522,15 +567,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // 4. Policy Governance & Access Security
-            let pol_path = policy.or_else(|| {
-                let default_p = PathBuf::from("policy.yaml");
-                if default_p.exists() {
-                    Some(default_p)
-                } else {
-                    None
-                }
-            });
-
+            // pol_path was already resolved above, since the baseline comparison needs
+            // the policy's checks.
             if let Some(ref p) = pol_path {
                 println!("\n[3] POLICY & SECURITY GOVERNANCE ({})", p.display());
                 match Policy::from_yaml_file(p) {
@@ -978,6 +1016,32 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     println!("Total Rules Defined: {}", loaded_policy.rules.len());
 
+                    // Show what is actually in force, not merely what parsed. These
+                    // globals used to be printed here and then ignored by the engine,
+                    // so an operator who set `default_hash: blake3` saw it echoed back
+                    // while SHA-256 was used.
+                    {
+                        let eff = loaded_policy.effective_scan_settings(None);
+                        println!("\n--------------- EFFECTIVE SETTINGS --------------");
+                        println!(
+                            "Hash Algorithm:      {:?} (from {})",
+                            eff.hash_algorithm.value, eff.hash_algorithm.source
+                        );
+                        println!(
+                            "I/O Rate Limit:      {} MB/s (from {})",
+                            eff.max_io_rate_mb_s.value, eff.max_io_rate_mb_s.source
+                        );
+                        println!(
+                            "Scan Priority:       {} (from {})",
+                            eff.scan_nice_priority.value, eff.scan_nice_priority.source
+                        );
+                        println!(
+                            "Sweep Interval:      {}s (from {})",
+                            eff.sweep_interval_secs.value, eff.sweep_interval_secs.source
+                        );
+                        println!("-------------------------------------------------");
+                    }
+
                     let roots = loaded_policy.get_monitored_roots();
                     println!("\nMonitored Root Paths ({}):", roots.len());
                     for r in &roots {
@@ -1060,6 +1124,116 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "[+] Ed25519 Detached Signature written to: {}",
                         out_path.display()
                     );
+                }
+
+                PolicyAction::Capabilities => {
+                    use openfim_common::{capability_matrix, platform_name};
+
+                    println!(
+                        "======================================================================"
+                    );
+                    println!(
+                        "     OPENFIM ENFORCEMENT CAPABILITIES ON {}",
+                        platform_name()
+                    );
+                    println!(
+                        "======================================================================"
+                    );
+                    println!("A check that cannot be enforced is reported as skipped, never as a");
+                    println!(
+                        "silent pass. An uncomparable field is an unknown, not a clean bill.\n"
+                    );
+
+                    println!("{:<14} {:<13} DETAIL", "CHECK", "STATUS");
+                    println!("{}", "-".repeat(70));
+                    for cap in capability_matrix() {
+                        println!(
+                            "{:<14} {:<13} {}",
+                            cap.check.field_name(),
+                            cap.support.label(),
+                            cap.support.note().unwrap_or(cap.check.purpose())
+                        );
+                    }
+
+                    let unsupported = openfim_common::unsupported_checks();
+                    println!();
+                    if unsupported.is_empty() {
+                        println!("[✓] Every check is enforceable on this platform.");
+                    } else {
+                        println!(
+                            "[!] {} of {} checks cannot be enforced here. Enabling one in a \
+                             policy is reported by `policy lint`.",
+                            unsupported.len(),
+                            openfim_common::Check::ALL.len()
+                        );
+                    }
+                    println!(
+                        "======================================================================"
+                    );
+                }
+
+                PolicyAction::Lint {
+                    policy,
+                    no_fs_check,
+                    verbose,
+                } => {
+                    use openfim_common::{lint_policy, LintSeverity};
+
+                    let pol = Policy::from_yaml_file(&policy)?;
+                    let report = lint_policy(&pol, !no_fs_check);
+
+                    println!(
+                        "======================================================================"
+                    );
+                    println!(
+                        "                      OPENFIM POLICY LINT                             "
+                    );
+                    println!(
+                        "======================================================================"
+                    );
+                    println!("Policy:   {} ({})", pol.policy_id, policy.display());
+                    println!("Rules:    {}", pol.rules.len());
+                    println!("Platform: {}", openfim_common::platform_name());
+                    println!();
+
+                    let shown: Vec<_> = report
+                        .findings
+                        .iter()
+                        .filter(|f| verbose || f.severity >= LintSeverity::Warning)
+                        .collect();
+
+                    if shown.is_empty() {
+                        println!("[✓] No findings. Every enabled control is enforceable here.");
+                    } else {
+                        for f in &shown {
+                            let marker = match f.severity {
+                                LintSeverity::Error => "[✗] ERROR  ",
+                                LintSeverity::Warning => "[!] WARNING",
+                                LintSeverity::Info => "[i] INFO   ",
+                            };
+                            println!("{} {} - {}", marker, f.code, f.message);
+                            if let Some(ref remedy) = f.remedy {
+                                println!("              fix: {}", remedy);
+                            }
+                        }
+                    }
+
+                    println!();
+                    println!(
+                        "Summary: {} error(s), {} warning(s), {} info",
+                        report.count(LintSeverity::Error),
+                        report.count(LintSeverity::Warning),
+                        report.count(LintSeverity::Info)
+                    );
+                    if !verbose && report.count(LintSeverity::Info) > 0 {
+                        println!("         (pass --verbose to see informational findings)");
+                    }
+                    println!(
+                        "======================================================================"
+                    );
+
+                    // Non-zero on anything actionable, so this can gate CI.
+                    std::process::exit(report.exit_code());
                 }
 
                 PolicyAction::TestPath { policy, path } => {

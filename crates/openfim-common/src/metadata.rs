@@ -201,6 +201,37 @@ impl FileMetadata {
         }
     }
 
+    /// POSIX permission bits, when `st_mode` carries them on this platform.
+    ///
+    /// Masked to the permission and set-id bits: `st_mode` also encodes the file type
+    /// in its high bits, so comparing the whole word would make a regular file becoming
+    /// a symlink look like a permission edit on top of the kind change already
+    /// reported.
+    ///
+    /// Returns `None` on Windows, where `st_mode` holds Win32 attribute flags and the
+    /// real access control policy lives in the security descriptor.
+    pub fn permission_bits(&self) -> Option<u32> {
+        if posix_mode_supported() {
+            Some(self.st_mode & 0o7777)
+        } else {
+            None
+        }
+    }
+
+    /// Filesystem attribute flags, when this platform records them.
+    ///
+    /// On Windows these are the Win32 attribute bits (read-only, hidden, system,
+    /// archive, …). Returns `None` on Unix, where the equivalent inode flags (the
+    /// `chattr` set) are not yet captured — rather than returning the POSIX mode,
+    /// which would make an attribute check silently duplicate the permission check.
+    pub fn attribute_flags(&self) -> Option<u32> {
+        if cfg!(windows) {
+            Some(self.st_mode)
+        } else {
+            None
+        }
+    }
+
     /// Returns the identity tuple used for cycle detection and hardlink tracking.
     pub fn identity_key(&self) -> (u64, u64) {
         (self.st_dev, self.st_ino)

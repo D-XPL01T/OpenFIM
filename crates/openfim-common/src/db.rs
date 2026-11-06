@@ -575,6 +575,52 @@ impl BaselineDb {
         }
     }
 
+    /// Re-anchors the recorded filesystem identity and timestamps for a path after an
+    /// approved change, keeping the content digest as the authority.
+    ///
+    /// Needed because an atomic restore writes a *new* filesystem object: content is
+    /// staged beside the target and renamed into place, which is what keeps the live
+    /// path from ever being observed half-written. The restored file therefore has a
+    /// different inode (or NTFS file index) than the baseline recorded, so the identity
+    /// check would report `FILE_REPLACED` on every successful rollback — the defensive
+    /// action raising an alert about itself.
+    ///
+    /// The update is guarded on the content digest matching what the baseline already
+    /// holds. That makes this safe: identity is only re-anchored when the bytes on disk
+    /// are provably the approved bytes, so it can never be used to bless a tampered
+    /// file. Returns whether a row was updated.
+    pub fn reanchor_entry_identity<P: AsRef<Path>>(
+        &self,
+        path: P,
+        current: &FileMetadata,
+    ) -> Result<bool> {
+        let candidates = path_lookup_candidates(path);
+        for key in candidates {
+            let updated = self.conn.execute(
+                r#"
+                UPDATE baseline_entries
+                   SET inode = ?1, dev = ?2, nlink = ?3,
+                       mtime = ?4, mtime_nsec = ?5, ctime = ?6
+                 WHERE path = ?7 AND sha256 = ?8
+                "#,
+                params![
+                    current.st_ino as i64,
+                    current.st_dev as i64,
+                    current.st_nlink as i64,
+                    current.st_mtime,
+                    current.st_mtime_nsec,
+                    current.st_ctime,
+                    key,
+                    current.sha256,
+                ],
+            )?;
+            if updated > 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Returns the total number of registered baseline entries
     pub fn count_entries(&self) -> Result<usize> {
         let count: i64 = self
@@ -1629,6 +1675,70 @@ mod tests {
             .diff_filesystem_scoped(&[], Some(Path::new("/etc")))
             .unwrap();
         assert_eq!(diff.removed.len(), 1);
+    }
+
+    // ---------------- Identity re-anchoring ----------------
+
+    #[test]
+    fn test_reanchor_updates_identity_when_content_matches() {
+        // An atomic restore renames a new object into place, so the inode changes while
+        // the content is provably the approved content. Without re-anchoring, the next
+        // event reports FILE_REPLACED and the rollback alerts about its own work.
+        let db = BaselineDb::open_in_memory().unwrap();
+        let digest = "a".repeat(64);
+        db.insert_entry(&dummy_file("/etc/app.conf", &digest, 10, 0o644), "v1")
+            .unwrap();
+
+        let mut restored = dummy_file("/etc/app.conf", &digest, 10, 0o644);
+        restored.st_ino = 777_777;
+        restored.st_dev = 55;
+        restored.st_mtime = 1_800_000_000;
+
+        assert!(db
+            .reanchor_entry_identity("/etc/app.conf", &restored)
+            .unwrap());
+
+        let stored = db.get_entry("/etc/app.conf").unwrap().unwrap();
+        assert_eq!(stored.st_ino, 777_777);
+        assert_eq!(stored.st_dev, 55);
+        assert_eq!(stored.st_mtime, 1_800_000_000);
+        assert_eq!(
+            stored.sha256, digest,
+            "the content digest must be untouched"
+        );
+    }
+
+    #[test]
+    fn test_reanchor_refuses_when_content_differs() {
+        // The safety property that makes re-anchoring acceptable: it can never be used
+        // to bless a tampered file as the new baseline, because it only fires when the
+        // bytes on disk already hash to what the baseline recorded.
+        let db = BaselineDb::open_in_memory().unwrap();
+        let approved = "a".repeat(64);
+        db.insert_entry(&dummy_file("/etc/app.conf", &approved, 10, 0o644), "v1")
+            .unwrap();
+
+        let mut tampered = dummy_file("/etc/app.conf", &"f".repeat(64), 10, 0o644);
+        tampered.st_ino = 999;
+
+        assert!(
+            !db.reanchor_entry_identity("/etc/app.conf", &tampered)
+                .unwrap(),
+            "re-anchoring must refuse content that does not match the baseline digest"
+        );
+
+        let stored = db.get_entry("/etc/app.conf").unwrap().unwrap();
+        assert_eq!(stored.sha256, approved);
+        assert_eq!(stored.st_ino, 100, "identity must be left as recorded");
+    }
+
+    #[test]
+    fn test_reanchor_is_a_noop_for_unknown_path() {
+        let db = BaselineDb::open_in_memory().unwrap();
+        let meta = dummy_file("/etc/never-seen", &"a".repeat(64), 1, 0o644);
+        assert!(!db
+            .reanchor_entry_identity("/etc/never-seen", &meta)
+            .unwrap());
     }
 
     // ---------------- Path keying ----------------

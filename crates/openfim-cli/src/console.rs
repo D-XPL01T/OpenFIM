@@ -1606,15 +1606,28 @@ fn run_inprocess_sensor(
                         StreamHasher::new(HashAlgorithm::Sha256, TokenBucket::new(rate_bytes));
                     if let Ok(cur_meta) = FileMetadata::extract(&path, &mut hasher) {
                         if let Ok(Some(base_meta)) = db.get_entry(&path) {
-                            if base_meta.sha256 != cur_meta.sha256 {
+                            // Shared detection engine. This block used to carry its own
+                            // hash-only comparison, a second implementation of the same
+                            // security decision that ignored every other check the rule
+                            // enabled and could drift from the daemon's verdict.
+                            let changes =
+                                openfim_common::evaluate(&base_meta, &cur_meta, &rule.checks);
+
+                            if !changes.is_clean() {
+                                let headline = changes
+                                    .most_severe()
+                                    .map(|c| c.event_type())
+                                    .unwrap_or("CHANGED");
                                 println!(
-                                    "\n{}[!] CRITICAL INTEGRITY ALERT: CONTENT_MUTATED on {}{}",
+                                    "\n{}[!] INTEGRITY ALERT: {} on {}{}",
                                     RED,
+                                    headline,
                                     path.display(),
                                     RESET
                                 );
-                                println!("    Old Hash: {}", base_meta.sha256);
-                                println!("    New Hash: {}", cur_meta.sha256);
+                                for change in &changes.changes {
+                                    println!("    [{}] {}", change.event_type(), change.describe());
+                                }
                                 if whodata.is_attributed {
                                     println!(
                                         "    Who-Data: PID={} Exe={:?}",
@@ -1628,49 +1641,58 @@ fn run_inprocess_sensor(
                                 }
 
                                 let attributed = whodata.is_attributed;
-                                let mut spool = openfim_common::SpoolEvent {
-                                    sequence_id: None,
-                                    event_id: format!("evt-{}", ts_nano),
-                                    timestamp_nano: ts_nano,
-                                    event_type: "CONTENT_MUTATED".to_string(),
-                                    path: openfim_common::normalize_path_str(&path),
-                                    severity: rule.severity,
-                                    // Leave these empty unless they really describe the
-                                    // actor; otherwise every event would name OpenFIM
-                                    // itself as the process that made the change.
-                                    whodata_pid: attributed.then_some(whodata.pid),
-                                    whodata_uid: if attributed { whodata.uid } else { None },
-                                    whodata_comm: if attributed {
-                                        whodata.comm.clone()
-                                    } else {
-                                        None
-                                    },
-                                    whodata_exe: if attributed {
-                                        whodata.exe.clone()
-                                    } else {
-                                        None
-                                    },
-                                    whodata_cmdline: if attributed {
-                                        whodata.cmdline.clone()
-                                    } else {
-                                        None
-                                    },
-                                    whodata_cgroup: None,
-                                    old_sha256: Some(base_meta.sha256),
-                                    new_sha256: Some(cur_meta.sha256),
-                                    diff_snippet: None,
-                                    hmac_signature: String::new(),
-                                    sent_to_manager: false,
-                                };
-                                if let Err(e) = db.append_spool_event_chained(&mut spool, &hmac_key)
-                                {
-                                    println!(
-                                        "    {}[!] Failed to record this event to the audit chain: {}{}",
-                                        RED, e, RESET
-                                    );
+                                for (n, change) in changes.changes.iter().enumerate() {
+                                    let (old_hash, new_hash) = change.hashes();
+                                    let mut spool = openfim_common::SpoolEvent {
+                                        sequence_id: None,
+                                        // event_id is UNIQUE in the schema and one change
+                                        // can yield several events in the same
+                                        // nanosecond, so the index is part of the id.
+                                        event_id: format!("evt-{}-{}", ts_nano, n),
+                                        timestamp_nano: ts_nano,
+                                        event_type: change.event_type().to_string(),
+                                        path: openfim_common::normalize_path_str(&path),
+                                        severity: rule.severity,
+                                        // Leave these empty unless they really describe
+                                        // the actor; otherwise every event would name
+                                        // OpenFIM itself as the process that changed it.
+                                        whodata_pid: attributed.then_some(whodata.pid),
+                                        whodata_uid: if attributed { whodata.uid } else { None },
+                                        whodata_comm: if attributed {
+                                            whodata.comm.clone()
+                                        } else {
+                                            None
+                                        },
+                                        whodata_exe: if attributed {
+                                            whodata.exe.clone()
+                                        } else {
+                                            None
+                                        },
+                                        whodata_cmdline: if attributed {
+                                            whodata.cmdline.clone()
+                                        } else {
+                                            None
+                                        },
+                                        whodata_cgroup: None,
+                                        old_sha256: old_hash.map(str::to_string),
+                                        new_sha256: new_hash.map(str::to_string),
+                                        diff_snippet: Some(change.describe()),
+                                        hmac_signature: String::new(),
+                                        sent_to_manager: false,
+                                    };
+                                    if let Err(e) =
+                                        db.append_spool_event_chained(&mut spool, &hmac_key)
+                                    {
+                                        println!(
+                                            "    {}[!] Failed to record this event to the audit chain: {}{}",
+                                            RED, e, RESET
+                                        );
+                                    }
                                 }
 
-                                if remediation {
+                                // Rollback only for content or object substitution; a
+                                // metadata edit does not justify overwriting the file.
+                                if remediation && changes.is_substantive() {
                                     match guard.execute(
                                         rule.active_response.action,
                                         &path,

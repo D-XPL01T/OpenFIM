@@ -32,6 +32,8 @@ libc = "0.2.169"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    # SetThreadPriority, for honouring globals.scan_nice_priority.
+    "Win32_System_Threading",
 ] }
 
 [dev-dependencies]

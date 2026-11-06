@@ -53,26 +53,40 @@ Legend: **✅ enforced** · **◐ partial** · **❌ unsupported on this platfor
 | Audit-log tamper detection | ✅ | ✅ | ✅ | Payload edits, interior deletion, and tail truncation (via signed chain anchor). |
 | Real-time change detection | ◐ | ◐ | ◐ | inotify / `ReadDirectoryChangesW`. Events can be dropped on queue overflow; no reconciliation sweep yet (plan §18.3.4). |
 | Active response (quarantine / restore) | ✅ | ✅ | ✅ | Circuit-breaker limited to 3/hour by default. |
+| File replaced / repointed (`FILE_REPLACED`) | ✅ | ✅ | ✅ | Compares filesystem identity unconditionally, so a hardlink or inode swap is caught even with every optional check off. |
+| Kind change and symlink retargeting | ✅ | ✅ | ✅ | Also unconditional: a config file replaced by a symlink is a compromise regardless of policy. |
 | `checks.hash` | ✅ | ✅ | ✅ | |
-| `checks.permissions` | ◐ | ◐ | ◐ | Compares `st_mode` only. On Windows that is attribute bits, so ACL changes are invisible. ACL hashing is plan §18.3.2. |
-| `checks.size` | ⬜ | ⬜ | ⬜ | Parsed, not enforced. Caught incidentally by `hash`. |
-| `checks.ownership` | ⬜ | ❌ | ⬜ | Not enforced. On Windows `uid`/`gid` are always 0, so it cannot work there without SID capture. |
-| `checks.timestamps` | ⬜ | ⬜ | ⬜ | Parsed, not enforced. |
-| `checks.attributes` | ⬜ | ⬜ | ⬜ | Parsed, not enforced. |
-| `checks.xattrs` | ⬜ | ⬜ | ⬜ | Parsed, not enforced; `xattrs_hash` is always `NULL`. |
-| `globals.default_hash` | ⬜ | ⬜ | ⬜ | Parsed and displayed; the hasher is hardcoded to SHA-256. |
-| `globals.max_io_rate_mb_s` | ⬜ | ⬜ | ⬜ | Parsed; throttling comes from `--throttle-mb-s` instead. |
-| `globals.scan_nice_priority` | ⬜ | ⬜ | ⬜ | Parsed, never applied. |
-| `globals.realtime_fallback_sweep_interval` | ⬜ | ⬜ | ⬜ | Parsed; no sweep exists. |
-| `rule.mode` (`scheduled` / `on_boot`) | ⬜ | ⬜ | ⬜ | Parsed; all modes behave as `realtime`. |
-| `rule.nodiff` | ⬜ | ⬜ | ⬜ | Parsed; moot until diff capture exists. |
+| `checks.size` | ✅ | ✅ | ✅ | Enforced independently of `hash`, so it still fires with hashing disabled. |
+| `checks.timestamps` | ✅ | ✅ | ✅ | Sub-second precision; defaults to off, since mtime churn is noisy. |
+| `checks.permissions` | ✅ | ❌ | ✅ | POSIX mode bits, masked to exclude file-type bits. Refused on Windows, where the access policy is in the DACL — ACL hashing is plan §18.3.2. |
+| `checks.ownership` | ✅ | ❌ | ✅ | Refused on Windows rather than silently passing: `uid`/`gid` are always 0 there, so a comparison would succeed regardless of the real owner. |
+| `checks.attributes` | ❌ | ✅ | ❌ | Win32 attribute flags. Refused on Unix, where the equivalent inode flags (`chattr`) are not yet captured. |
+| `checks.xattrs` | ⬜ | ⬜ | ⬜ | Not yet captured, so requesting it is reported as a skipped check rather than a pass. |
+| `globals.default_hash` | ✅ | ✅ | ✅ | Drives the hasher; `policy check` shows the effective value and its source. |
+| `globals.max_io_rate_mb_s` | ✅ | ✅ | ✅ | `--throttle-mb-s` overrides it; precedence is reported at startup. |
+| `globals.scan_nice_priority` | ✅ | ✅ | ◐ | `setpriority` on Unix, `SetThreadPriority` on Windows. A failure to apply is reported, not swallowed. |
+| `globals.realtime_fallback_sweep_interval` | ⬜ | ⬜ | ⬜ | No reconciliation sweep yet (plan §18.3.4). `policy lint` warns when it is 0. |
+| `rule.mode` (`scheduled` / `on_boot`) | ⬜ | ⬜ | ⬜ | All modes still behave as `realtime` (plan §18.3.4). |
+| `rule.nodiff` | ⬜ | ⬜ | ⬜ | Moot until diff capture exists (plan §18.3.5). `policy lint` warns on secret-shaped paths. |
+| Unknown policy fields rejected | ✅ | ✅ | ✅ | A typo such as `cheks:` is a parse error listing the valid fields, not a silently-defaulted control. |
+| `policy lint` | ✅ | ✅ | ✅ | 16 checks for configuration that parses but will not act; exits non-zero so it can gate CI. |
+| `policy capabilities` | ✅ | ✅ | ✅ | Prints this matrix for the running platform. |
 | **Process attribution (who-data)** | ⬜ | ⬜ | ⬜ | Not implemented. Reported honestly as `UNATTRIBUTED`; needs fanotify `FAN_REPORT_PIDFD`, eBPF, or a Windows minifilter. |
 | Central manager / gRPC / SIEM forwarding | ⬜ | ⬜ | ⬜ | Roadmap Phase 2. |
 | Package-manager change intelligence | ⬜ | ⬜ | ⬜ | Roadmap Phase 2. |
 | TPM 2.0 key sealing | ⬜ | ⬜ | ⬜ | Roadmap Phase 3. |
 
-**12 of 18 policy fields are parsed but not yet enforced.** Closing that gap is Phase 1
-of [`18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md`](file:///d:/VibeCode/file_integrity/docs/18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md).
+**13 of 18 policy fields are now enforced, or explicitly refused with a reason.** The
+five still outstanding are `checks.xattrs`, `globals.realtime_fallback_sweep_interval`,
+`rule.mode`, `rule.nodiff` and `rule.whodata`, tracked in
+[`18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md`](file:///d:/VibeCode/file_integrity/docs/18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md)
+§18.3.2, §18.3.4 and §18.3.5.
+
+A ❌ in the matrix is not an oversight. It means the control is **refused with a stated
+reason** rather than quietly comparing fields that cannot change — `policy lint` reports
+it, `policy capabilities` prints it, the daemon says so at startup, and a verdict names
+the check it could not perform. "I compared it and it is fine" and "I could not compare
+it" are different statements, and only one of them is true.
 
 ---
 
@@ -84,8 +98,10 @@ Read this before deploying OpenFIM anywhere you care about.
   This is the main capability that distinguishes a FIM from a checksum script, and it
   requires kernel support that is not yet implemented. Alerts say `UNATTRIBUTED` rather
   than guessing.
-- **Most of the policy schema is not yet enforced.** See the capability matrix. A policy
-  file that loads cleanly and displays as active may configure controls that do nothing.
+- **Five policy fields are still not enforced** (`checks.xattrs`,
+  `globals.realtime_fallback_sweep_interval`, `rule.mode`, `rule.nodiff`,
+  `rule.whodata`). Requesting any of them is now reported — by `policy lint`, by the
+  daemon at startup, and in each verdict — rather than passing silently.
 - **Real-time monitoring can miss events.** The watcher drops events under load
   (inotify queue overflow, `ReadDirectoryChangesW` buffer overrun), and there is no
   reconciliation sweep yet, so a miss is permanent and silent.

@@ -263,6 +263,7 @@ impl ActiveResponseAction {
 
 /// Active response configuration block
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 pub struct ActiveResponseConfig {
     #[serde(default)]
     pub action: ActiveResponseAction,
@@ -270,6 +271,7 @@ pub struct ActiveResponseConfig {
 
 /// Metadata and content checks enabled for a rule
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RuleChecks {
     #[serde(default = "default_true")]
     pub hash: bool,
@@ -331,6 +333,7 @@ fn default_sha256_str() -> String {
 
 /// Global scanner performance options and defaults
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyGlobals {
     #[serde(default = "default_sha256_str")]
     pub default_hash: String,
@@ -358,6 +361,7 @@ impl Default for PolicyGlobals {
 
 /// Individual file integrity rule definition
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PolicyRule {
     pub id: String,
     pub description: String,
@@ -390,6 +394,7 @@ pub struct PolicyRule {
 
 /// Complete declarative OpenFIM Policy
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Policy {
     pub version: String,
     pub policy_id: String,
@@ -409,7 +414,200 @@ fn default_ed25519_str() -> String {
     "ed25519".to_string()
 }
 
+/// Where an effective setting came from, so `policy check` can show precedence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SettingSource {
+    /// A command-line flag, which overrides the policy.
+    CommandLine,
+    /// The policy's `globals` block.
+    Policy,
+    /// The built-in default, because neither of the above supplied a value.
+    Default,
+}
+
+impl std::fmt::Display for SettingSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            SettingSource::CommandLine => "command line",
+            SettingSource::Policy => "policy globals",
+            SettingSource::Default => "built-in default",
+        })
+    }
+}
+
+/// A resolved setting plus where it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Effective<T> {
+    pub value: T,
+    pub source: SettingSource,
+}
+
+impl<T: std::fmt::Display> std::fmt::Display for Effective<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} (from {})", self.value, self.source)
+    }
+}
+
+/// The scanner settings actually in force, after resolving CLI over policy over default.
+///
+/// Before this existed, `globals.default_hash`, `max_io_rate_mb_s` and
+/// `scan_nice_priority` were parsed, printed by `policy check`, and then ignored — the
+/// hasher was hardcoded to SHA-256 and throttling came only from a CLI flag. An
+/// operator who set `default_hash: blake3` got SHA-256 with no indication.
+#[derive(Debug, Clone)]
+pub struct EffectiveScanSettings {
+    pub hash_algorithm: Effective<crate::hasher::HashAlgorithm>,
+    pub max_io_rate_mb_s: Effective<u64>,
+    pub scan_nice_priority: Effective<i32>,
+    pub sweep_interval_secs: Effective<u64>,
+}
+
+impl EffectiveScanSettings {
+    /// Rate limit in bytes per second, saturating rather than overflowing.
+    pub fn rate_bytes_per_sec(&self) -> u64 {
+        self.max_io_rate_mb_s
+            .value
+            .saturating_mul(1024)
+            .saturating_mul(1024)
+    }
+}
+
+/// Applies the scan priority to the current thread, best effort.
+///
+/// Reports failure rather than succeeding silently: on Unix lowering the nice value
+/// requires privilege, and an operator who asked for a priority change deserves to know
+/// it did not happen.
+pub fn apply_scan_priority(nice: i32) -> std::result::Result<(), String> {
+    #[cfg(unix)]
+    {
+        // SAFETY: setpriority with PRIO_PROCESS and who=0 targets the calling process
+        // and cannot violate memory safety.
+        let rc = unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, nice) };
+        if rc == 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "setpriority({}) failed: {}",
+                nice,
+                std::io::Error::last_os_error()
+            ))
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        // Windows has no per-thread nice value. Map the POSIX-style range onto the
+        // nearest thread priority so the intent (scan politely) is honoured.
+        use windows_sys::Win32::System::Threading::{
+            GetCurrentThread, SetThreadPriority, THREAD_PRIORITY_ABOVE_NORMAL,
+            THREAD_PRIORITY_BELOW_NORMAL, THREAD_PRIORITY_LOWEST, THREAD_PRIORITY_NORMAL,
+        };
+
+        let priority = if nice >= 10 {
+            THREAD_PRIORITY_LOWEST
+        } else if nice > 0 {
+            THREAD_PRIORITY_BELOW_NORMAL
+        } else if nice == 0 {
+            THREAD_PRIORITY_NORMAL
+        } else {
+            THREAD_PRIORITY_ABOVE_NORMAL
+        };
+
+        // SAFETY: GetCurrentThread returns a pseudo-handle that needs no release, and
+        // SetThreadPriority only mutates scheduler state.
+        let ok = unsafe { SetThreadPriority(GetCurrentThread(), priority) };
+        if ok != 0 {
+            Ok(())
+        } else {
+            Err(format!(
+                "SetThreadPriority failed: {}",
+                std::io::Error::last_os_error()
+            ))
+        }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    {
+        let _ = nice;
+        Err("scan priority is not supported on this platform".to_string())
+    }
+}
+
 impl Policy {
+    /// Resolves the scan settings actually in force.
+    ///
+    /// Precedence is command line, then policy globals, then built-in default. The
+    /// source is carried along so the CLI can show the operator which one won instead
+    /// of leaving them to guess why their policy value had no effect.
+    pub fn effective_scan_settings(&self, cli_throttle_mb_s: Option<u64>) -> EffectiveScanSettings {
+        let defaults = PolicyGlobals::default();
+
+        let hash_algorithm = match self.globals.default_hash.parse::<crate::HashAlgorithm>() {
+            Ok(algo) if self.globals.default_hash != defaults.default_hash => Effective {
+                value: algo,
+                source: SettingSource::Policy,
+            },
+            Ok(algo) => Effective {
+                value: algo,
+                source: SettingSource::Default,
+            },
+            // An unparseable algorithm is caught by `policy lint`; fall back rather
+            // than panicking in the sensor's startup path.
+            Err(_) => Effective {
+                value: crate::HashAlgorithm::Sha256,
+                source: SettingSource::Default,
+            },
+        };
+
+        let max_io_rate_mb_s = match cli_throttle_mb_s {
+            Some(v) => Effective {
+                value: v,
+                source: SettingSource::CommandLine,
+            },
+            None if self.globals.max_io_rate_mb_s != defaults.max_io_rate_mb_s => Effective {
+                value: self.globals.max_io_rate_mb_s,
+                source: SettingSource::Policy,
+            },
+            None => Effective {
+                value: defaults.max_io_rate_mb_s,
+                source: SettingSource::Default,
+            },
+        };
+
+        let scan_nice_priority = if self.globals.scan_nice_priority != defaults.scan_nice_priority {
+            Effective {
+                value: self.globals.scan_nice_priority,
+                source: SettingSource::Policy,
+            }
+        } else {
+            Effective {
+                value: defaults.scan_nice_priority,
+                source: SettingSource::Default,
+            }
+        };
+
+        let sweep_interval_secs = if self.globals.realtime_fallback_sweep_interval
+            != defaults.realtime_fallback_sweep_interval
+        {
+            Effective {
+                value: self.globals.realtime_fallback_sweep_interval,
+                source: SettingSource::Policy,
+            }
+        } else {
+            Effective {
+                value: defaults.realtime_fallback_sweep_interval,
+                source: SettingSource::Default,
+            }
+        };
+
+        EffectiveScanSettings {
+            hash_algorithm,
+            max_io_rate_mb_s,
+            scan_nice_priority,
+            sweep_interval_secs,
+        }
+    }
+
     /// Deserializes a Policy from a YAML string
     pub fn from_yaml_str(yaml_str: &str) -> Result<Self> {
         let policy: Policy = serde_yaml::from_str(yaml_str)?;
