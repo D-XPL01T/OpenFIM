@@ -44,15 +44,18 @@ This actionable, day-by-day implementation plan guides the solo researcher throu
 ## Week 2: Real-Time Event Sensor, Attribution & Client-Side Verifier
 
 - [x] **Day 6: Real-Time File Integrity Sensor Daemon**
-  - [x] Implement cross-platform filesystem event listener using asynchronous `notify` engine (Windows ReadDirectoryChangesW, Linux inotify/fanotify).
+  - [x] Implement cross-platform filesystem event listener using the `notify` engine (Windows `ReadDirectoryChangesW`, Linux inotify).
+  - [ ] **Not implemented:** fanotify. The `notify` crate uses inotify on Linux, which reports *what* changed but carries no actor information and can silently drop events on queue overflow. Moving to fanotify is prerequisite work for process attribution — see [`18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md`](file:///d:/VibeCode/file_integrity/docs/18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md) §18.7.
   - [x] Watch all path targets and directories defined in signed YAML policies.
   - [x] Implement sliding-window debouncing (250ms) to suppress multi-stage editor write noise.
   - [x] Integrate with tokio asynchronous runtime and graceful shutdown handling.
 
-- [x] **Day 7: Process Attribution Engine (Who-Data)**
-  - [x] Implement lightweight `ProcessContext` resolver (`whodata.rs`) extracting acting PID, PPID, exe, cmdline, and UID.
+- [~] **Day 7: Process Attribution Engine (Who-Data)** — *partially complete*
+  - [x] Implement lightweight `ProcessContext` resolver (`whodata.rs`) extracting PID, PPID, exe, cmdline, and UID **for a given PID**.
   - [x] Support Linux `/proc/[pid]/exe` and `/proc/[pid]/cmdline` with cross-platform Win32 fallback.
-  - [x] Enrich every security alert and spooled event tuple with actor process identity.
+  - [ ] **Not implemented: resolving the *acting* PID.** A userspace watcher built on inotify / `ReadDirectoryChangesW` is told which path changed and nothing about who changed it. `ProcessContext::current()` therefore resolves the sensor's *own* process, not the writer.
+  - [x] Report this honestly rather than fabricating attribution: `ProcessContext::is_attributed` is false, the who-data columns are left `NULL`, alerts print `UNATTRIBUTED`, and the daemon states the limitation at startup.
+  - [ ] **Prerequisite for real attribution:** fanotify with `FAN_REPORT_PIDFD`, an eBPF probe, or a Windows filesystem minifilter. Tracked in [`16_ROADMAP.md`](file:///d:/VibeCode/file_integrity/docs/16_ROADMAP.md) Phase 2.
 
 - [x] **Day 8: Standalone Browser Verifier UI (`verifier.html`)**
   - [x] Create standalone single-file HTML5/CSS3/JavaScript application (`web/verifier.html`).
@@ -70,5 +73,7 @@ This actionable, day-by-day implementation plan guides the solo researcher throu
     - [x] Test 1: Timestomping evasion test -> verify content change flagged regardless of timestamp.
     - [x] Test 2: Tamper-evident spool audit -> verify sequence gaps and payload tampering detected.
     - [x] Test 3: Active response quarantine & baseline restoration -> verify malicious payload isolated and pristine file restored.
-    - [x] Test 4: Who-data forensic attribution -> verify process metadata resolution.
-  - [x] Full workspace test suite passing (26/26 tests passing in < 3s).
+    - [x] Test 4: Who-data forensic attribution -> verify process metadata resolution for a given PID (not actor resolution; see Day 7).
+    - [x] Test 5: Tail-truncation evasion -> verify deleting the end of the audit log is detected via the signed chain anchor.
+    - [x] Test 6: Concurrent reader/writer -> verify the CLI can audit a database the daemon holds open.
+  - [x] Full workspace test suite passing (97 tests in < 3s).
