@@ -904,6 +904,75 @@ impl BaselineDb {
         Ok(seq)
     }
 
+    /// Approximate on-disk size of the spool, in bytes.
+    ///
+    /// Measured from SQLite's own page accounting rather than the file size, so the
+    /// figure is meaningful in WAL mode where the main database file lags behind.
+    pub fn spool_size_bytes(&self) -> Result<u64> {
+        let page_count: i64 =
+            self.conn
+                .query_row("SELECT * FROM pragma_page_count()", [], |r| r.get(0))?;
+        let page_size: i64 = self
+            .conn
+            .query_row("SELECT * FROM pragma_page_size()", [], |r| r.get(0))?;
+        Ok((page_count.max(0) as u64).saturating_mul(page_size.max(0) as u64))
+    }
+
+    /// Prunes the oldest, lowest-severity *already-forwarded* events to stay within a
+    /// quota, implementing RSK-03.
+    ///
+    /// Three properties make this safe to do to an append-only audit log:
+    ///
+    /// 1. **Only events already sent to a manager are candidates.** An unsent event is
+    ///    the only copy in existence and is never dropped.
+    /// 2. **Lowest severity goes first**, so an informational record is discarded
+    ///    before a critical one.
+    /// 3. **The chain anchor is left untouched.** Pruning therefore *does* make
+    ///    `verify_spool_chain` report truncation, which is correct and deliberate: rows
+    ///    really are gone, and the caller is expected to record a signed
+    ///    `SPOOL_PRUNED` event stating what was removed. Silently repairing the anchor
+    ///    would turn a quota mechanism into an evidence-destruction tool that leaves no
+    ///    trace, which is exactly the capability an attacker wants.
+    ///
+    /// Returns the number of rows removed.
+    pub fn prune_spool_to_quota(&self, max_bytes: u64) -> Result<usize> {
+        if max_bytes == 0 {
+            return Ok(0);
+        }
+        if self.spool_size_bytes()? <= max_bytes {
+            return Ok(0);
+        }
+
+        let mut total_removed = 0usize;
+
+        // Remove in batches, re-measuring between them: page accounting only changes
+        // once pages are actually freed.
+        for _ in 0..64 {
+            if self.spool_size_bytes()? <= max_bytes {
+                break;
+            }
+            let removed = self.conn.execute(
+                r#"
+                DELETE FROM event_spool
+                 WHERE sequence_id IN (
+                       SELECT sequence_id FROM event_spool
+                        WHERE sent_to_manager = 1
+                        ORDER BY severity ASC, sequence_id ASC
+                        LIMIT 256
+                 )
+                "#,
+                [],
+            )?;
+            if removed == 0 {
+                // Nothing left that is safe to drop: every remaining event is unsent.
+                break;
+            }
+            total_removed += removed;
+        }
+
+        Ok(total_removed)
+    }
+
     /// Total number of rows currently in the event spool.
     pub fn count_spool_events(&self) -> Result<usize> {
         let count: i64 = self
@@ -1675,6 +1744,93 @@ mod tests {
             .diff_filesystem_scoped(&[], Some(Path::new("/etc")))
             .unwrap();
         assert_eq!(diff.removed.len(), 1);
+    }
+
+    // ---------------- Spool quota ----------------
+
+    #[test]
+    fn test_quota_never_drops_unsent_events() {
+        // The safety property that makes pruning acceptable: an unsent event is the
+        // only copy that exists, so it is never a candidate however tight the quota.
+        let db = seeded_db(40);
+        assert_eq!(db.count_spool_events().unwrap(), 40);
+
+        // A 1-byte quota is as aggressive as it gets.
+        let removed = db.prune_spool_to_quota(1).unwrap();
+
+        assert_eq!(
+            removed, 0,
+            "pruning removed {} unsent event(s); unsent events are the only copy",
+            removed
+        );
+        assert_eq!(db.count_spool_events().unwrap(), 40);
+    }
+
+    #[test]
+    fn test_quota_prunes_forwarded_events_lowest_severity_first() {
+        let db = BaselineDb::open_in_memory().unwrap();
+        for i in 0..30 {
+            let mut ev = spool_event(&format!("evt-{}", i), &format!("/etc/f{}", i));
+            // Alternate between informational and critical.
+            ev.severity = if i % 2 == 0 { 1 } else { 10 };
+            db.append_spool_event_chained(&mut ev, TEST_KEY).unwrap();
+        }
+        // Mark everything as forwarded, making it eligible.
+        db.connection()
+            .execute("UPDATE event_spool SET sent_to_manager = 1", [])
+            .unwrap();
+
+        let removed = db.prune_spool_to_quota(1).unwrap();
+        assert!(removed > 0, "nothing was pruned under a 1-byte quota");
+
+        // Whatever survives must be weighted towards the high-severity records.
+        let low: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM event_spool WHERE severity = 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let high: i64 = db
+            .connection()
+            .query_row(
+                "SELECT COUNT(*) FROM event_spool WHERE severity = 10",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            low <= high,
+            "pruning kept {} low-severity and {} high-severity events; low severity \
+             should be discarded first",
+            low,
+            high
+        );
+    }
+
+    #[test]
+    fn test_quota_of_zero_disables_pruning() {
+        let db = seeded_db(10);
+        db.connection()
+            .execute("UPDATE event_spool SET sent_to_manager = 1", [])
+            .unwrap();
+        assert_eq!(db.prune_spool_to_quota(0).unwrap(), 0);
+        assert_eq!(db.count_spool_events().unwrap(), 10);
+    }
+
+    #[test]
+    fn test_quota_is_a_noop_when_under_budget() {
+        let db = seeded_db(5);
+        // A generous quota: nothing should be touched.
+        assert_eq!(db.prune_spool_to_quota(1024 * 1024 * 1024).unwrap(), 0);
+        assert_eq!(db.count_spool_events().unwrap(), 5);
+    }
+
+    #[test]
+    fn test_spool_size_is_reported() {
+        let db = seeded_db(5);
+        assert!(db.spool_size_bytes().unwrap() > 0);
     }
 
     // ---------------- Identity re-anchoring ----------------

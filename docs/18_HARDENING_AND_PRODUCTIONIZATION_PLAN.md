@@ -9,12 +9,17 @@
 | Phase | State | Notes |
 |---|---|---|
 | **Phase 0** — documentation truth | **done** | Capability matrix and limitations published; checklist claims corrected. |
-| **Phase 1** — policy contract | **partial** | Done: 1.1–1.5 (`detect.rs`, all call sites routed), 1.9 (attributes split from permissions), 1.10–1.12 (globals honoured), 1.21–1.23 (schema closed, `policy lint`, capability matrix as code). Outstanding: 1.6–1.8 (xattr/ACL/SID capture), 1.13 (`max_spool_mb`), 1.14–1.17 (modes, sweep, overflow, heartbeat), 1.18–1.20 (diff capture and `nodiff`). |
+| **Phase 1** — policy contract | **partial** | Done: 1.1–1.5 (`detect.rs`, all call sites routed), 1.9 (attributes split from permissions), 1.10–1.13 (globals honoured, spool quota), 1.14–1.17 (rule modes, reconciliation sweep, overflow detection, heartbeats), 1.21–1.23 (schema closed, `policy lint`, capability matrix as code). Outstanding: 1.6–1.8 (xattr/ACL/SID capture), 1.18–1.20 (diff capture and `nodiff`, which must land together). |
 | **Phase 2** — operational hardening | **partial** | Done: 2.1 (content-addressed backup store), jumped ahead as a data-loss fix. Outstanding: 2.2–2.19. |
 | **Phase 3** — portfolio grade | **partial** | Done: 3.1 (three-platform CI). Outstanding: 3.2–3.17. |
 
-**13 of 18 policy fields** are now enforced or explicitly refused with a stated reason,
-up from 6 at the baseline commit. The test suite has grown from 97 to 171.
+**17 of 19 policy fields** are now enforced or explicitly refused with a stated reason,
+up from 6 at the baseline commit. The test suite has grown from 97 to 191.
+
+The two still outstanding are `checks.xattrs` (needs the metadata capture in §18.3.2)
+and `rule.nodiff` (meaningless until diff capture exists, and §18.6.4 requires the two
+to land together so there is never a window where contents are written to the database
+without the suppression guarantee in place).
 
 This plan closes the gap between what OpenFIM's policy schema *accepts* and what the
 engine *enforces*, then raises the surrounding project to the standard expected of a

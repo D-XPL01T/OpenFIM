@@ -10,6 +10,7 @@ pub mod lint;
 pub mod metadata;
 pub mod policy;
 pub mod rate_limiter;
+pub mod sweep;
 pub mod whodata;
 
 pub use backup::{
@@ -40,4 +41,8 @@ pub use policy::{
     DEFAULT_MAX_REMEDIATIONS_PER_HOUR,
 };
 pub use rate_limiter::TokenBucket;
+pub use sweep::{
+    reconcile, MissingEntry, SweepFinding, SweepOutcome, SweepReason, EVENT_HEARTBEAT,
+    EVENT_SPOOL_PRUNED, EVENT_SWEEP_FOUND, EVENT_WATCH_OVERFLOW,
+};
 pub use whodata::ProcessContext;

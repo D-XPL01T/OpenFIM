@@ -9,9 +9,10 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use openfim_common::notify::{self, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use openfim_common::{
-    evaluate, support_for, BackupStore, BaselineDb, ChangeKind, ChangeSet, Check, CompiledPolicy,
-    FileMetadata, HashAlgorithm, Policy, PolicyRule, PolicyVerifier, ProcessContext,
-    RemediationGuard, SpoolEvent, StreamHasher, TokenBucket, DEFAULT_MAX_REMEDIATIONS_PER_HOUR,
+    evaluate, reconcile, support_for, BackupStore, BaselineDb, ChangeKind, ChangeSet, Check,
+    CompiledPolicy, FileMetadata, HashAlgorithm, Policy, PolicyRule, PolicyVerifier,
+    ProcessContext, RemediationGuard, RuleMode, SpoolEvent, StreamHasher, SweepReason, TokenBucket,
+    DEFAULT_MAX_REMEDIATIONS_PER_HOUR, EVENT_HEARTBEAT, EVENT_SPOOL_PRUNED, EVENT_WATCH_OVERFLOW,
 };
 
 /// Debounce window for coalescing multi-stage editor writes.
@@ -72,6 +73,13 @@ struct Args {
     /// Maximum automated remediations per rolling hour (circuit breaker; 0 disables)
     #[arg(long, default_value_t = DEFAULT_MAX_REMEDIATIONS_PER_HOUR)]
     max_remediations_per_hour: u32,
+
+    /// Seconds between liveness heartbeats and spool-quota enforcement.
+    ///
+    /// Heartbeats make a coverage gap visible: without them, an agent stopped by an
+    /// attacker is indistinguishable from an agent with nothing to report.
+    #[arg(long, default_value_t = 300)]
+    heartbeat_secs: u64,
 
     /// Optional directory containing pristine baseline backups for file restoration
     #[arg(long)]
@@ -291,10 +299,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         notify::Config::default(),
     )?;
 
-    // Register watch paths from policy rules (deduplicating directories)
+    // Register watch paths from policy rules (deduplicating directories).
+    //
+    // `rule.mode` is honoured here rather than ignored: only `realtime` rules get a
+    // kernel watch. `scheduled` and `on_boot` rules are covered by the reconciliation
+    // sweep instead, which is the whole point of declaring a mode. Watching everything
+    // regardless would quietly make the field meaningless.
     let mut watched_targets = std::collections::HashSet::new();
     let mut registered_count = 0;
+    let mut sweep_only_rules = 0;
     for rule in &policy.rules {
+        if rule.mode != RuleMode::Realtime {
+            sweep_only_rules += 1;
+            continue;
+        }
         for path_str in &rule.paths {
             let p = Path::new(path_str);
             let watch_target = if p.is_dir() {
@@ -319,7 +337,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         "[*] Real-time sensor active: watching {} filesystem target(s)",
         registered_count
     );
-    if registered_count == 0 {
+    if sweep_only_rules > 0 {
+        println!(
+            "[*] {} rule(s) are scheduled or on-boot, so they are covered by the \
+             reconciliation sweep rather than by a live watch.",
+            sweep_only_rules
+        );
+    }
+    if registered_count == 0 && sweep_only_rules == 0 {
         eprintln!(
             "[!] Warning: 0 watch targets could be registered. Verify monitored paths exist on disk."
         );
@@ -351,9 +376,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         0
     });
 
+    let sweep_interval = Duration::from_secs(settings.sweep_interval_secs.value);
+    if sweep_interval.is_zero() {
+        println!(
+            "[!] Reconciliation sweep DISABLED (globals.realtime_fallback_sweep_interval \
+             is 0). Events dropped by the watcher will not be recovered."
+        );
+    } else {
+        println!(
+            "[*] Reconciliation sweep: every {}s (from {})",
+            sweep_interval.as_secs(),
+            settings.sweep_interval_secs.source
+        );
+    }
+
+    // Read through the compiled policy: the owned `Policy` was moved into it above.
+    let max_spool_mb = compiled.policy().globals.max_spool_mb;
+    let max_spool_bytes = max_spool_mb.saturating_mul(1024).saturating_mul(1024);
+    println!(
+        "[*] Spool quota:       {}",
+        if max_spool_bytes == 0 {
+            "unlimited".to_string()
+        } else {
+            format!("{} MB", max_spool_mb)
+        }
+    );
+
     let loop_cfg = SensorConfig {
         rate_bytes: settings.rate_bytes_per_sec(),
         hash_algorithm: settings.hash_algorithm.value,
+        sweep_interval,
+        heartbeat_interval: Duration::from_secs(args.heartbeat_secs),
+        max_spool_bytes,
         remediation: args.remediation,
         backup: backup_store,
         hmac_key,
@@ -375,6 +429,12 @@ struct SensorConfig {
     rate_bytes: u64,
     /// Algorithm the policy asked for, rather than a hardcoded SHA-256.
     hash_algorithm: HashAlgorithm,
+    /// How often to reconcile against the baseline. `ZERO` disables the sweep.
+    sweep_interval: Duration,
+    /// How often to emit a liveness beacon and enforce the spool quota.
+    heartbeat_interval: Duration,
+    /// Spool disk quota in bytes; 0 disables the cap.
+    max_spool_bytes: u64,
     remediation: bool,
     /// Opened once at startup rather than per event: the store parses its index from
     /// disk, which has no business happening inside the hot path.
@@ -391,6 +451,22 @@ fn sensor_loop(
     shutdown: Arc<AtomicBool>,
 ) {
     let mut debounce: HashMap<PathBuf, Instant> = HashMap::new();
+    let mut reported = ReportedState::default();
+
+    // Startup reconciliation, covering everything that changed while the agent was not
+    // running. Without it, a modification made during downtime is never noticed: the
+    // watcher only reports changes that happen after its watch is registered.
+    run_sweep(
+        SweepReason::Boot,
+        &db,
+        &policy,
+        &mut guard,
+        &cfg,
+        &mut reported,
+    );
+
+    let mut next_sweep = Instant::now() + cfg.sweep_interval;
+    let mut next_heartbeat = Instant::now() + cfg.heartbeat_interval;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -399,6 +475,40 @@ fn sensor_loop(
 
         match rx.recv_timeout(Duration::from_millis(200)) {
             Ok(event) => {
+                // The watcher admitting it dropped events is itself a security-relevant
+                // fact. On Linux this is inotify's IN_Q_OVERFLOW; on Windows it is a
+                // ReadDirectoryChangesW buffer overrun. Everything in that window is
+                // gone, so record the gap and reconcile immediately rather than
+                // carrying on as though coverage were continuous.
+                if event.need_rescan() {
+                    eprintln!(
+                        "\n[!] WATCHER OVERFLOW: the kernel dropped filesystem events. \
+                         An unobserved window exists; forcing immediate reconciliation."
+                    );
+                    record_bare_event(
+                        &db,
+                        EVENT_WATCH_OVERFLOW,
+                        Path::new("<watcher>"),
+                        10,
+                        Some(
+                            "the filesystem event queue overflowed; changes in this \
+                             window were not observed in real time"
+                                .to_string(),
+                        ),
+                        &cfg.hmac_key,
+                    );
+                    run_sweep(
+                        SweepReason::WatchOverflow,
+                        &db,
+                        &policy,
+                        &mut guard,
+                        &cfg,
+                        &mut reported,
+                    );
+                    next_sweep = Instant::now() + cfg.sweep_interval;
+                    continue;
+                }
+
                 let should_check = matches!(
                     event.kind,
                     EventKind::Modify(_) | EventKind::Create(_) | EventKind::Remove(_)
@@ -435,10 +545,290 @@ fn sensor_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 // Background maintenance: clean old debounce entries
                 debounce.retain(|_, v| v.elapsed() < Duration::from_secs(5));
+
+                let now = Instant::now();
+
+                if cfg.sweep_interval > Duration::ZERO && now >= next_sweep {
+                    run_sweep(
+                        SweepReason::Periodic,
+                        &db,
+                        &policy,
+                        &mut guard,
+                        &cfg,
+                        &mut reported,
+                    );
+                    next_sweep = Instant::now() + cfg.sweep_interval;
+                }
+
+                if now >= next_heartbeat {
+                    emit_heartbeat(&db, &cfg);
+                    enforce_spool_quota(&db, &cfg);
+                    next_heartbeat = Instant::now() + cfg.heartbeat_interval;
+                }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
         }
     }
+
+    // A clean shutdown is recorded, so that a gap in the chain distinguishes "the
+    // operator stopped the agent" from "something killed it".
+    record_bare_event(
+        &db,
+        "SENSOR_STOPPED",
+        Path::new("<sensor>"),
+        1,
+        Some("graceful shutdown".to_string()),
+        &cfg.hmac_key,
+    );
+}
+
+/// Tracks which divergences have already been reported, so an unresolved one is not
+/// re-announced on every sweep.
+///
+/// Without this, a divergence the operator has chosen not to remediate is reported
+/// afresh every interval: in the live test above, the same change was announced every
+/// two seconds. That buries genuinely new findings in repetition and, because every
+/// repeat is a chained spool event, drives the spool straight into its quota.
+///
+/// Keyed by path and current digest, so the suppression is specific to *this* observed
+/// state. If the file changes again the digest differs and the new state is reported
+/// immediately — nothing is ever hidden, only de-duplicated.
+#[derive(Default)]
+struct ReportedState {
+    seen: HashMap<PathBuf, String>,
+}
+
+impl ReportedState {
+    /// Returns true when this exact state has not been reported yet, recording it.
+    fn is_new(&mut self, path: &Path, fingerprint: &str) -> bool {
+        match self.seen.get(path) {
+            Some(prev) if prev == fingerprint => false,
+            _ => {
+                self.seen
+                    .insert(path.to_path_buf(), fingerprint.to_string());
+                true
+            }
+        }
+    }
+
+    /// Forgets a path, so its next divergence is reported again. Used after a
+    /// successful remediation, since the file is back to its approved state.
+    fn forget(&mut self, path: &Path) {
+        self.seen.remove(path);
+    }
+}
+
+/// Runs a reconciliation sweep and records whatever it finds.
+fn run_sweep(
+    reason: SweepReason,
+    db: &BaselineDb,
+    policy: &CompiledPolicy,
+    guard: &mut RemediationGuard,
+    cfg: &SensorConfig,
+    reported: &mut ReportedState,
+) {
+    let roots = policy.policy().get_monitored_roots();
+    if roots.is_empty() {
+        return;
+    }
+
+    println!("[*] Reconciliation sweep starting ({})", reason);
+    let started = Instant::now();
+
+    let mut hasher = StreamHasher::new(cfg.hash_algorithm, TokenBucket::new(cfg.rate_bytes));
+    let outcome = match reconcile(db, policy, &roots, &mut hasher) {
+        Ok(o) => o,
+        Err(e) => {
+            eprintln!("[!] Reconciliation sweep failed: {}", e);
+            return;
+        }
+    };
+
+    let whodata = ProcessContext::for_observed_event();
+    let ts_nano = unix_now_nanos();
+    let mut suppressed = 0usize;
+
+    for finding in &outcome.findings {
+        if !reported.is_new(&finding.path, &finding.current.sha256) {
+            suppressed += 1;
+            continue;
+        }
+
+        println!(
+            "\n[!] SWEEP DIVERGENCE on {} ({} change(s) the watcher did not report)",
+            finding.path.display(),
+            finding.changes.len()
+        );
+        print_change_alert(&finding.path, finding.severity, &whodata, &finding.changes);
+
+        for change in &finding.changes.changes {
+            let mut spool =
+                create_spool_event_for(change, &finding.path, finding.severity, &whodata, ts_nano);
+            // Mark the provenance: a divergence found by sweep means a real-time event
+            // was missed, which matters to an investigator.
+            spool.diff_snippet = Some(format!("[{}] {}", reason.label(), change.describe()));
+            record_event(db, &mut spool, &cfg.hmac_key);
+        }
+
+        if finding.changes.is_substantive() {
+            if let Some(rule) = policy.find_matching_rule(&finding.path) {
+                // Only clear the suppression when the file was genuinely restored. If
+                // remediation is disabled or declined, the divergence is still
+                // outstanding and must stay suppressed rather than being re-announced
+                // on every sweep.
+                if apply_remediation(&finding.path, rule, guard, cfg, db) {
+                    reported.forget(&finding.path);
+                }
+            }
+        }
+    }
+
+    for missing in &outcome.missing {
+        if !reported.is_new(&missing.baseline.path, "<deleted>") {
+            suppressed += 1;
+            continue;
+        }
+        println!(
+            "\n[!] SWEEP DIVERGENCE: {} is in the baseline but missing from disk",
+            missing.baseline.path.display()
+        );
+        let mut spool = create_spool_event(
+            "FILE_DELETED",
+            &missing.baseline.path,
+            missing.severity,
+            &whodata,
+            ts_nano,
+            Some(missing.baseline.sha256.clone()),
+            None,
+        );
+        spool.diff_snippet = Some(format!("[{}] file no longer present", reason.label()));
+        record_event(db, &mut spool, &cfg.hmac_key);
+    }
+
+    for added in &outcome.unbaselined {
+        if !reported.is_new(&added.path, &added.sha256) {
+            suppressed += 1;
+            continue;
+        }
+        println!(
+            "\n[!] SWEEP DIVERGENCE: unbaselined file present at {}",
+            added.path.display()
+        );
+        let mut spool = create_spool_event(
+            "FILE_CREATED",
+            &added.path,
+            5,
+            &whodata,
+            ts_nano,
+            None,
+            Some(added.sha256.clone()),
+        );
+        spool.diff_snippet = Some(format!("[{}] not present in baseline", reason.label()));
+        record_event(db, &mut spool, &cfg.hmac_key);
+    }
+
+    for (path, err) in &outcome.errors {
+        eprintln!("[!] Sweep could not read {}: {}", path.display(), err);
+    }
+
+    // Suppression is reported, never hidden. The operator must be able to tell
+    // "nothing is wrong" from "the same thing is still wrong and I have stopped
+    // repeating myself".
+    let suppression_note = if suppressed > 0 {
+        format!(
+            ", {} unchanged divergence(s) still outstanding (already reported)",
+            suppressed
+        )
+    } else {
+        String::new()
+    };
+
+    println!(
+        "[*] Reconciliation sweep complete in {:.1}s: {}{}",
+        started.elapsed().as_secs_f64(),
+        outcome.summary(),
+        suppression_note
+    );
+}
+
+/// Periodic liveness beacon.
+///
+/// Without this, "the agent was stopped by an attacker" and "nothing happened" look
+/// identical in the audit log: both are an absence of events. A regular signed
+/// heartbeat turns a coverage gap into a visible gap.
+fn emit_heartbeat(db: &BaselineDb, cfg: &SensorConfig) {
+    record_bare_event(
+        db,
+        EVENT_HEARTBEAT,
+        Path::new("<sensor>"),
+        1,
+        Some("sensor alive".to_string()),
+        &cfg.hmac_key,
+    );
+}
+
+/// Keeps the spool inside its configured quota (RSK-03).
+fn enforce_spool_quota(db: &BaselineDb, cfg: &SensorConfig) {
+    if cfg.max_spool_bytes == 0 {
+        return;
+    }
+    match db.prune_spool_to_quota(cfg.max_spool_bytes) {
+        Ok(0) => {}
+        Ok(removed) => {
+            println!(
+                "[*] Spool exceeded its {} MB quota; pruned {} already-forwarded event(s).",
+                cfg.max_spool_bytes / (1024 * 1024),
+                removed
+            );
+            // Record what was dropped. Pruning rows makes chain verification report
+            // truncation, which is correct: the rows really are gone. This event is the
+            // explanation an auditor needs, and it is itself chained.
+            record_bare_event(
+                db,
+                EVENT_SPOOL_PRUNED,
+                Path::new("<spool>"),
+                7,
+                Some(format!(
+                    "pruned {} forwarded event(s) to stay within the {} MB quota; \
+                     chain verification will report truncation from this point",
+                    removed,
+                    cfg.max_spool_bytes / (1024 * 1024)
+                )),
+                &cfg.hmac_key,
+            );
+        }
+        Err(e) => eprintln!("[!] Could not enforce the spool quota: {}", e),
+    }
+}
+
+/// Records an operational event that is not tied to a monitored file.
+fn record_bare_event(
+    db: &BaselineDb,
+    event_type: &str,
+    path: &Path,
+    severity: u32,
+    detail: Option<String>,
+    hmac_key: &[u8],
+) {
+    let whodata = ProcessContext::for_observed_event();
+    let mut spool = create_spool_event(
+        event_type,
+        path,
+        severity,
+        &whodata,
+        unix_now_nanos(),
+        None,
+        None,
+    );
+    spool.diff_snippet = detail;
+    record_event(db, &mut spool, hmac_key);
+}
+
+fn unix_now_nanos() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos() as i64
 }
 
 fn handle_path_event(
@@ -569,24 +959,36 @@ fn record_event(db: &BaselineDb, spool: &mut SpoolEvent, hmac_key: &[u8]) {
     }
 }
 
+/// Returns whether remediation actually restored the file to its approved state.
+///
+/// The return value matters: callers use it to decide whether a divergence has been
+/// resolved. Treating a declined or disabled remediation as a resolution would clear
+/// the suppression state and make the same unresolved divergence be re-announced on
+/// every sweep.
 fn apply_remediation(
     path: &Path,
     rule: &PolicyRule,
     guard: &mut RemediationGuard,
     cfg: &SensorConfig,
     db: &BaselineDb,
-) {
+) -> bool {
     if !cfg.remediation {
-        return;
+        return false;
     }
     match guard.execute(rule.active_response.action, path, cfg.backup.as_ref()) {
         Ok(outcome) => {
             println!("    [REMEDIATION] {}", outcome);
             if outcome.was_applied() {
                 reanchor_after_restore(path, cfg, db);
+                true
+            } else {
+                false
             }
         }
-        Err(e) => eprintln!("    [REMEDIATION] failed: {}", e),
+        Err(e) => {
+            eprintln!("    [REMEDIATION] failed: {}", e);
+            false
+        }
     }
 }
 
@@ -866,8 +1268,68 @@ mod tests {
             throttle_mb_s: None,
             remediation: false,
             max_remediations_per_hour: 3,
+            heartbeat_secs: 300,
             backup_dir: None,
         }
+    }
+
+    #[test]
+    fn reported_state_suppresses_repeats_but_not_new_states() {
+        // An unresolved divergence must be announced once, not on every sweep: in a
+        // live test with a 2s interval the same finding was re-reported every cycle,
+        // and each repeat is a chained spool event, so the spool fills with noise.
+        let mut reported = ReportedState::default();
+        let path = Path::new("/etc/app.conf");
+
+        assert!(
+            reported.is_new(path, "digest-a"),
+            "first observation is new"
+        );
+        assert!(
+            !reported.is_new(path, "digest-a"),
+            "the same unchanged state must be suppressed"
+        );
+        assert!(
+            !reported.is_new(path, "digest-a"),
+            "suppression must persist across sweeps"
+        );
+
+        // A genuinely different state is reported immediately. Nothing is hidden.
+        assert!(
+            reported.is_new(path, "digest-b"),
+            "a new state must be reported even though the path was seen before"
+        );
+        assert!(!reported.is_new(path, "digest-b"));
+    }
+
+    #[test]
+    fn reported_state_tracks_paths_independently() {
+        let mut reported = ReportedState::default();
+        assert!(reported.is_new(Path::new("/a"), "d1"));
+        assert!(
+            reported.is_new(Path::new("/b"), "d1"),
+            "a different path with the same digest is a separate finding"
+        );
+        assert!(!reported.is_new(Path::new("/a"), "d1"));
+    }
+
+    #[test]
+    fn forgetting_a_path_allows_it_to_be_reported_again() {
+        // Called only after a *successful* restore: the file is back to its approved
+        // state, so the next divergence there is genuinely new. Clearing it after a
+        // declined or disabled remediation was a bug that defeated suppression
+        // entirely.
+        let mut reported = ReportedState::default();
+        let path = Path::new("/etc/app.conf");
+
+        assert!(reported.is_new(path, "tampered"));
+        assert!(!reported.is_new(path, "tampered"));
+
+        reported.forget(path);
+        assert!(
+            reported.is_new(path, "tampered"),
+            "after remediation restores the file, a fresh tamper must be reported"
+        );
     }
 
     #[test]

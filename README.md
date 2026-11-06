@@ -64,9 +64,10 @@ Legend: **✅ enforced** · **◐ partial** · **❌ unsupported on this platfor
 | `checks.xattrs` | ⬜ | ⬜ | ⬜ | Not yet captured, so requesting it is reported as a skipped check rather than a pass. |
 | `globals.default_hash` | ✅ | ✅ | ✅ | Drives the hasher; `policy check` shows the effective value and its source. |
 | `globals.max_io_rate_mb_s` | ✅ | ✅ | ✅ | `--throttle-mb-s` overrides it; precedence is reported at startup. |
+| `globals.max_spool_mb` | ✅ | ✅ | ✅ | Disk quota (RSK-03). Prunes only already-forwarded events, lowest severity first, and records a chained `SPOOL_PRUNED` event. |
 | `globals.scan_nice_priority` | ✅ | ✅ | ◐ | `setpriority` on Unix, `SetThreadPriority` on Windows. A failure to apply is reported, not swallowed. |
-| `globals.realtime_fallback_sweep_interval` | ⬜ | ⬜ | ⬜ | No reconciliation sweep yet (plan §18.3.4). `policy lint` warns when it is 0. |
-| `rule.mode` (`scheduled` / `on_boot`) | ⬜ | ⬜ | ⬜ | All modes still behave as `realtime` (plan §18.3.4). |
+| `globals.realtime_fallback_sweep_interval` | ✅ | ✅ | ✅ | Drives the reconciliation sweep. Set to 0 to disable, which the daemon and `policy lint` both warn about. |
+| `rule.mode` (`scheduled` / `on_boot`) | ✅ | ✅ | ✅ | Only `realtime` rules get a kernel watch; the others are covered by the sweep. |
 | `rule.nodiff` | ⬜ | ⬜ | ⬜ | Moot until diff capture exists (plan §18.3.5). `policy lint` warns on secret-shaped paths. |
 | Unknown policy fields rejected | ✅ | ✅ | ✅ | A typo such as `cheks:` is a parse error listing the valid fields, not a silently-defaulted control. |
 | `policy lint` | ✅ | ✅ | ✅ | 16 checks for configuration that parses but will not act; exits non-zero so it can gate CI. |
@@ -76,9 +77,8 @@ Legend: **✅ enforced** · **◐ partial** · **❌ unsupported on this platfor
 | Package-manager change intelligence | ⬜ | ⬜ | ⬜ | Roadmap Phase 2. |
 | TPM 2.0 key sealing | ⬜ | ⬜ | ⬜ | Roadmap Phase 3. |
 
-**13 of 18 policy fields are now enforced, or explicitly refused with a reason.** The
-five still outstanding are `checks.xattrs`, `globals.realtime_fallback_sweep_interval`,
-`rule.mode`, `rule.nodiff` and `rule.whodata`, tracked in
+**17 of 19 policy fields are now enforced, or explicitly refused with a reason.** The
+two still outstanding are `checks.xattrs` and `rule.nodiff`, tracked in
 [`18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md`](file:///d:/VibeCode/file_integrity/docs/18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md)
 §18.3.2, §18.3.4 and §18.3.5.
 
@@ -98,13 +98,16 @@ Read this before deploying OpenFIM anywhere you care about.
   This is the main capability that distinguishes a FIM from a checksum script, and it
   requires kernel support that is not yet implemented. Alerts say `UNATTRIBUTED` rather
   than guessing.
-- **Five policy fields are still not enforced** (`checks.xattrs`,
-  `globals.realtime_fallback_sweep_interval`, `rule.mode`, `rule.nodiff`,
-  `rule.whodata`). Requesting any of them is now reported — by `policy lint`, by the
-  daemon at startup, and in each verdict — rather than passing silently.
-- **Real-time monitoring can miss events.** The watcher drops events under load
-  (inotify queue overflow, `ReadDirectoryChangesW` buffer overrun), and there is no
-  reconciliation sweep yet, so a miss is permanent and silent.
+- **Two policy fields are still not enforced** (`checks.xattrs` and `rule.nodiff`).
+  Requesting either is now reported — by `policy lint`, by the daemon at startup, and
+  in each verdict — rather than passing silently. `rule.whodata` is likewise reported
+  as unavailable, since attribution needs kernel support.
+- **Real-time monitoring can still miss events, but no longer silently.** The watcher
+  drops events under load (inotify queue overflow, `ReadDirectoryChangesW` buffer
+  overrun). A periodic reconciliation sweep now recovers those misses, an overflow is
+  recorded as a `WATCH_OVERFLOW` event and forces an immediate sweep, and a startup
+  sweep covers changes made while the agent was not running. Heartbeat events make a
+  coverage gap visible rather than indistinguishable from quiet.
 - **The agent does not defend itself.** The baseline database is an ordinary file. An
   attacker who can modify monitored files can usually also delete `openfim.db` or stop
   the agent. The audit chain proves the log was not *edited*; a retained off-host

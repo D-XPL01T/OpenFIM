@@ -519,6 +519,94 @@ fn test_adversary_cannot_exploit_backup_filename_collision() {
     );
 }
 
+/// Red-team scenario: the adversary changes a monitored file while the sensor is not
+/// watching — during downtime, a restart, or a window the kernel dropped.
+///
+/// Real-time watching alone cannot see this. Without reconciliation the miss is
+/// permanent and silent: the file stays compromised, the baseline still holds the old
+/// digest, and nothing records that a window went unobserved.
+#[test]
+fn test_change_made_while_unwatched_is_recovered_by_sweep() {
+    use openfim_common::{reconcile, CompiledPolicy, Policy};
+
+    let dir = tempfile::tempdir().unwrap();
+    let target = dir.path().join("production.conf");
+    std::fs::write(&target, b"approved configuration").unwrap();
+
+    // Baseline while clean.
+    let mut db = BaselineDb::open_in_memory().unwrap();
+    let crawler = FileCrawler::new(CrawlOptions::default());
+    let mut hasher = StreamHasher::default_sha256();
+    let snapshot = crawler.crawl(dir.path(), &mut hasher).unwrap();
+    db.insert_batch(&snapshot, "v1").unwrap();
+
+    let policy_yaml = format!(
+        r#"
+version: "1.0"
+policy_id: "sweep-recovery"
+name: "Sweep Recovery"
+author: "test"
+rules:
+  - id: "PROD"
+    description: "production config"
+    paths:
+      - "{}"
+    recursive: true
+    severity: 10
+    checks:
+      hash: true
+      size: true
+      permissions: false
+      ownership: false
+      timestamps: false
+      attributes: false
+      xattrs: false
+"#,
+        dir.path().to_string_lossy().replace('\\', "/")
+    );
+    let compiled = CompiledPolicy::new(Policy::from_yaml_str(&policy_yaml).unwrap());
+
+    // The adversary acts with nothing watching at all.
+    std::fs::write(&target, b"backdoored configuration").unwrap();
+    let deleted = dir.path().join("deleted_by_attacker.conf");
+    std::fs::write(&deleted, b"x").unwrap();
+
+    // Re-baseline so the deletion is detectable, then remove the file.
+    let snapshot2 = crawler.crawl(dir.path(), &mut hasher).unwrap();
+    db.insert_batch(&snapshot2, "v2").unwrap();
+    std::fs::write(&target, b"backdoored configuration again").unwrap();
+    std::fs::remove_file(&deleted).unwrap();
+    std::fs::write(dir.path().join("dropped_payload.sh"), b"#!/bin/sh\n").unwrap();
+
+    let roots = compiled.policy().get_monitored_roots();
+    let outcome = reconcile(&db, &compiled, &roots, &mut hasher).unwrap();
+
+    assert_eq!(
+        outcome.findings.len(),
+        1,
+        "the content change made while unwatched was not recovered: {}",
+        outcome.summary()
+    );
+    assert!(outcome.findings[0]
+        .changes
+        .event_types()
+        .contains(&"CONTENT_MUTATED"));
+
+    assert_eq!(
+        outcome.missing.len(),
+        1,
+        "the deletion made while unwatched was not recovered: {}",
+        outcome.summary()
+    );
+
+    assert_eq!(
+        outcome.unbaselined.len(),
+        1,
+        "the file dropped while unwatched was not recovered: {}",
+        outcome.summary()
+    );
+}
+
 /// A legacy flat backup directory must be refused outright, not silently treated as
 /// empty or, worse, used as-is.
 #[test]

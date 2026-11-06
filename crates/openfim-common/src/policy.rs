@@ -323,6 +323,10 @@ fn default_nice() -> i32 {
     10
 }
 
+fn default_max_spool_mb() -> u64 {
+    500
+}
+
 fn default_sweep_interval() -> u64 {
     3600
 }
@@ -346,6 +350,10 @@ pub struct PolicyGlobals {
 
     #[serde(default = "default_sweep_interval")]
     pub realtime_fallback_sweep_interval: u64,
+
+    /// Disk quota for the local event spool, in megabytes (RSK-03). 0 disables the cap.
+    #[serde(default = "default_max_spool_mb")]
+    pub max_spool_mb: u64,
 }
 
 impl Default for PolicyGlobals {
@@ -355,6 +363,7 @@ impl Default for PolicyGlobals {
             max_io_rate_mb_s: 25,
             scan_nice_priority: 10,
             realtime_fallback_sweep_interval: 3600,
+            max_spool_mb: 500,
         }
     }
 }
