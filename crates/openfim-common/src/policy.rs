@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::backup::{BackupStore, RestoreOutcome};
 use crate::error::{OpenFimError, Result};
 
 /// Execution mode for a monitoring rule
@@ -146,7 +147,7 @@ impl RemediationGuard {
         &mut self,
         action: ActiveResponseAction,
         path: P,
-        backup_dir: Option<&Path>,
+        backup: Option<&BackupStore>,
     ) -> std::io::Result<RemediationOutcome> {
         if action == ActiveResponseAction::None {
             return Ok(RemediationOutcome::NotConfigured);
@@ -159,7 +160,7 @@ impl RemediationGuard {
                 self.max_per_hour
             )));
         }
-        action.execute(path, backup_dir)
+        action.execute(path, backup)
     }
 }
 
@@ -171,7 +172,7 @@ impl ActiveResponseAction {
     pub fn execute<P: AsRef<Path>>(
         &self,
         path: P,
-        backup_dir: Option<&Path>,
+        backup: Option<&BackupStore>,
     ) -> std::io::Result<RemediationOutcome> {
         let p = path.as_ref();
         match self {
@@ -200,18 +201,26 @@ impl ActiveResponseAction {
                 )))
             }
             Self::RestoreBaseline => {
-                let backup_file = match backup_dir {
-                    Some(dir) => dir.join(p.file_name().unwrap_or_default()),
+                let store = match backup {
+                    Some(s) => s,
                     None => {
                         return Ok(RemediationOutcome::Declined(
-                            "no backup directory configured, so no pristine copy is available \
+                            "no backup store configured, so no pristine copy is available \
                              to restore; leaving the file in place for manual triage"
                                 .to_string(),
                         ))
                     }
                 };
 
-                if !backup_file.exists() {
+                match store.restore(p) {
+                    Ok(RestoreOutcome::Restored { sha256, size }) => {
+                        Ok(RemediationOutcome::Applied(format!(
+                            "restored pristine state ({} bytes, sha256 {}) from the backup store at {}",
+                            size,
+                            &sha256[..sha256.len().min(16)],
+                            store.root().display()
+                        )))
+                    }
                     // Deliberately do NOT fall back to quarantine here.
                     //
                     // Quarantine *moves the file away*. Silently substituting it for a
@@ -219,31 +228,19 @@ impl ActiveResponseAction {
                     // live file", which is a destructive outcome the operator never
                     // asked for and the single most dangerous failure mode in the
                     // whole response path.
-                    return Ok(RemediationOutcome::Declined(format!(
-                        "no pristine backup found at {}; refusing to substitute a \
-                         destructive quarantine for the requested restore",
-                        backup_file.display()
-                    )));
-                }
-
-                // Restore via a temporary file plus rename so the monitored path is
-                // never observed truncated or half-written by the live workload.
-                let tmp = p.with_extension(format!(
-                    "{}.openfim-restore",
-                    p.extension()
-                        .map(|e| e.to_string_lossy().to_string())
-                        .unwrap_or_default()
-                ));
-                std::fs::copy(&backup_file, &tmp)?;
-                match std::fs::rename(&tmp, p) {
-                    Ok(()) => Ok(RemediationOutcome::Applied(format!(
-                        "restored pristine state from {}",
-                        backup_file.display()
+                    Ok(RestoreOutcome::NoBackup) => Ok(RemediationOutcome::Declined(format!(
+                        "no pristine copy of {} in the backup store at {}; refusing to \
+                         substitute a destructive quarantine for the requested restore",
+                        p.display(),
+                        store.root().display()
                     ))),
-                    Err(e) => {
-                        let _ = std::fs::remove_file(&tmp);
-                        Err(e)
-                    }
+                    // A corrupt store, a missing object, or a digest mismatch. The live
+                    // file is left untouched by `BackupStore::restore` in every one of
+                    // these cases, so report and decline rather than act on bad data.
+                    Err(e) => Ok(RemediationOutcome::Declined(format!(
+                        "restore aborted, live file left untouched: {}",
+                        e
+                    ))),
                 }
             }
             Self::KillProcess => {
@@ -1183,11 +1180,10 @@ rules:
         let target = dir.path().join("production.env");
         std::fs::write(&target, b"live production data").unwrap();
 
-        let empty_backups = dir.path().join("backups");
-        std::fs::create_dir_all(&empty_backups).unwrap();
+        let empty_store = BackupStore::open_or_create(dir.path().join("store")).unwrap();
 
         let outcome = ActiveResponseAction::RestoreBaseline
-            .execute(&target, Some(&empty_backups))
+            .execute(&target, Some(&empty_store))
             .unwrap();
 
         assert!(
@@ -1209,13 +1205,15 @@ rules:
     fn test_restore_baseline_restores_from_backup() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("app.conf");
-        let backups = dir.path().join("backups");
-        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(&target, b"pristine").unwrap();
+
+        let mut store = BackupStore::open_or_create(dir.path().join("store")).unwrap();
+        store.store_file(&target, "v1").unwrap();
+
         std::fs::write(&target, b"TAMPERED BY ADVERSARY").unwrap();
-        std::fs::write(backups.join("app.conf"), b"pristine").unwrap();
 
         let outcome = ActiveResponseAction::RestoreBaseline
-            .execute(&target, Some(&backups))
+            .execute(&target, Some(&store))
             .unwrap();
 
         assert!(outcome.was_applied(), "{}", outcome.message());
@@ -1226,13 +1224,14 @@ rules:
     fn test_restore_leaves_no_temporary_file_behind() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("app.conf");
-        let backups = dir.path().join("backups");
-        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(&target, b"good").unwrap();
+
+        let mut store = BackupStore::open_or_create(dir.path().join("store")).unwrap();
+        store.store_file(&target, "v1").unwrap();
         std::fs::write(&target, b"bad").unwrap();
-        std::fs::write(backups.join("app.conf"), b"good").unwrap();
 
         ActiveResponseAction::RestoreBaseline
-            .execute(&target, Some(&backups))
+            .execute(&target, Some(&store))
             .unwrap();
 
         let strays: Vec<_> = std::fs::read_dir(dir.path())
@@ -1275,23 +1274,20 @@ rules:
     #[test]
     fn test_remediation_circuit_breaker_opens_after_limit() {
         let dir = tempfile::tempdir().unwrap();
-        let backups = dir.path().join("backups");
-        std::fs::create_dir_all(&backups).unwrap();
-        std::fs::write(backups.join("f.conf"), b"good").unwrap();
+        let target = dir.path().join("f.conf");
+        std::fs::write(&target, b"good").unwrap();
+
+        let mut store = BackupStore::open_or_create(dir.path().join("store")).unwrap();
+        store.store_file(&target, "v1").unwrap();
 
         let mut guard = RemediationGuard::new(3);
         let mut applied = 0;
         let mut declined = 0;
 
         for _ in 0..6 {
-            let target = dir.path().join("f.conf");
             std::fs::write(&target, b"bad").unwrap();
             let outcome = guard
-                .execute(
-                    ActiveResponseAction::RestoreBaseline,
-                    &target,
-                    Some(&backups),
-                )
+                .execute(ActiveResponseAction::RestoreBaseline, &target, Some(&store))
                 .unwrap();
             if outcome.was_applied() {
                 applied += 1;

@@ -288,6 +288,33 @@ pub enum BaselineAction {
         #[arg(short, long, default_value = "json")]
         format: String,
     },
+
+    /// Capture pristine copies of every baselined file into a content-addressed
+    /// backup store, for use by `active_response: restore_baseline`
+    Backup {
+        /// Path to SQLite database holding the baseline
+        #[arg(long)]
+        db: PathBuf,
+
+        /// Backup store directory (created if absent)
+        #[arg(short, long)]
+        out: PathBuf,
+
+        /// Label recorded against each captured copy
+        #[arg(short, long, default_value = "v1")]
+        version: String,
+
+        /// Re-capture paths that already have a copy, picking up approved changes
+        #[arg(long)]
+        refresh: bool,
+    },
+
+    /// Re-hash every object in a backup store and report corruption
+    VerifyBackup {
+        /// Backup store directory
+        #[arg(short, long)]
+        store: PathBuf,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -783,6 +810,121 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         format,
                         out.display()
                     );
+                }
+                BaselineAction::Backup {
+                    db,
+                    out,
+                    version,
+                    refresh,
+                } => {
+                    use openfim_common::BackupStore;
+
+                    let baseline_db = BaselineDb::open(&db)?;
+                    let entries = baseline_db.get_all_entries()?;
+                    let mut store = BackupStore::open_or_create(&out)?;
+
+                    println!(
+                        "[*] Capturing pristine copies into content-addressed store: {}",
+                        out.display()
+                    );
+
+                    let mut captured = 0usize;
+                    let mut skipped_existing = 0usize;
+                    let mut skipped_missing = 0usize;
+                    let mut skipped_kind = 0usize;
+                    let mut failed = 0usize;
+
+                    for entry in &entries {
+                        // Directories and symlinks have no content to restore.
+                        if entry.is_dir || entry.is_symlink {
+                            skipped_kind += 1;
+                            continue;
+                        }
+                        if !entry.path.exists() {
+                            skipped_missing += 1;
+                            continue;
+                        }
+                        if !refresh && store.lookup(&entry.path).is_some() {
+                            skipped_existing += 1;
+                            continue;
+                        }
+                        match store.store_file(&entry.path, &version) {
+                            Ok(_) => captured += 1,
+                            Err(e) => {
+                                eprintln!("    [!] {}: {}", entry.path.display(), e);
+                                failed += 1;
+                            }
+                        }
+                    }
+
+                    store.save()?;
+
+                    println!("[+] Backup store updated under version '{}':", version);
+                    println!("      Captured:          {}", captured);
+                    if skipped_existing > 0 {
+                        println!(
+                            "      Already present:   {} (pass --refresh to re-capture)",
+                            skipped_existing
+                        );
+                    }
+                    if skipped_missing > 0 {
+                        println!(
+                            "      Absent from disk:  {} (in baseline but not present)",
+                            skipped_missing
+                        );
+                    }
+                    if skipped_kind > 0 {
+                        println!(
+                            "      Not restorable:    {} (directories / symlinks)",
+                            skipped_kind
+                        );
+                    }
+                    if failed > 0 {
+                        println!("      Failed:            {}", failed);
+                    }
+                    println!("      Total indexed:     {}", store.len());
+                    println!(
+                        "[i] Point the agent at this directory with --backup-dir {}",
+                        out.display()
+                    );
+                }
+                BaselineAction::VerifyBackup { store } => {
+                    use openfim_common::BackupStore;
+
+                    let opened = match BackupStore::open_existing(&store)? {
+                        Some(s) => s,
+                        None => {
+                            eprintln!(
+                                "[!] No backup store found at {} (expected a {} index).",
+                                store.display(),
+                                openfim_common::MANIFEST_FILE
+                            );
+                            std::process::exit(1);
+                        }
+                    };
+
+                    println!(
+                        "[*] Verifying {} indexed pristine cop{} in {}",
+                        opened.len(),
+                        if opened.len() == 1 { "y" } else { "ies" },
+                        store.display()
+                    );
+
+                    let problems = opened.verify()?;
+                    if problems.is_empty() {
+                        println!(
+                            "[✓] Backup store intact: every object matches its recorded digest."
+                        );
+                    } else {
+                        println!(
+                            "[✗] Backup store CORRUPT: {} problem(s) found:",
+                            problems.len()
+                        );
+                        for p in &problems {
+                            println!("      - {}", p);
+                        }
+                        std::process::exit(1);
+                    }
                 }
             }
         }

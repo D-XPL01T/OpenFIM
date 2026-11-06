@@ -4,8 +4,9 @@ use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
 use openfim_common::{
-    ActiveResponseAction, BaselineDb, CrawlOptions, FileCrawler, FileMetadata, HashAlgorithm,
-    OpenFimError, ProcessContext, SpoolEvent, StreamHasher, TokenBucket, DEFAULT_BUFFER_SIZE,
+    ActiveResponseAction, BackupStore, BaselineDb, CrawlOptions, FileCrawler, FileMetadata,
+    HashAlgorithm, OpenFimError, ProcessContext, SpoolEvent, StreamHasher, TokenBucket,
+    DEFAULT_BUFFER_SIZE,
 };
 
 #[test]
@@ -427,10 +428,16 @@ fn test_day8_active_response_quarantine_and_restore() {
     let backup_dir = tempfile::tempdir().unwrap();
 
     let target_file = dir.path().join("compromised.sh");
-    std::fs::write(&target_file, b"MALICIOUS SCRIPT").unwrap();
 
-    let pristine_backup = backup_dir.path().join("compromised.sh");
-    std::fs::write(&pristine_backup, b"PRISTINE SCRIPT").unwrap();
+    // Capture the pristine copy into the content-addressed store first, which is how an
+    // operator populates it via `openfim-cli baseline backup`.
+    std::fs::write(&target_file, b"PRISTINE SCRIPT").unwrap();
+    let mut store = BackupStore::open_or_create(backup_dir.path().join("store")).unwrap();
+    store.store_file(&target_file, "v1").unwrap();
+    store.save().unwrap();
+
+    // Adversary replaces it.
+    std::fs::write(&target_file, b"MALICIOUS SCRIPT").unwrap();
 
     // 1. Test Quarantine
     let res = ActiveResponseAction::Quarantine
@@ -445,7 +452,7 @@ fn test_day8_active_response_quarantine_and_restore() {
 
     // 2. Test Restore Baseline
     let res_restore = ActiveResponseAction::RestoreBaseline
-        .execute(&target_file, Some(backup_dir.path()))
+        .execute(&target_file, Some(&store))
         .unwrap();
     assert!(res_restore.was_applied(), "{}", res_restore.message());
     assert!(res_restore.message().contains("restored"));
@@ -458,7 +465,7 @@ fn test_day8_active_response_quarantine_and_restore() {
     let unbacked = dir.path().join("no_backup_here.conf");
     std::fs::write(&unbacked, b"LIVE DATA").unwrap();
     let declined = ActiveResponseAction::RestoreBaseline
-        .execute(&unbacked, Some(backup_dir.path()))
+        .execute(&unbacked, Some(&store))
         .unwrap();
     assert!(!declined.was_applied());
     assert!(
@@ -466,6 +473,63 @@ fn test_day8_active_response_quarantine_and_restore() {
         "a failed restore must not remove the live file"
     );
     assert_eq!(std::fs::read(&unbacked).unwrap(), b"LIVE DATA");
+}
+
+/// Red-team scenario: two monitored files share a filename in different directories.
+///
+/// A flat `backup_dir.join(file_name)` store maps both to one backup, so restoring
+/// either writes the other's contents over a live file. That is silent data destruction
+/// performed by the defensive control itself.
+#[test]
+fn test_adversary_cannot_exploit_backup_filename_collision() {
+    let work = tempfile::tempdir().unwrap();
+
+    let nginx_dir = work.path().join("etc/nginx/conf.d");
+    let app_dir = work.path().join("opt/myapp/config");
+    std::fs::create_dir_all(&nginx_dir).unwrap();
+    std::fs::create_dir_all(&app_dir).unwrap();
+
+    let nginx_conf = nginx_dir.join("app.conf");
+    let app_conf = app_dir.join("app.conf");
+    std::fs::write(&nginx_conf, b"listen 443 ssl;").unwrap();
+    std::fs::write(&app_conf, b"debug = false").unwrap();
+
+    let mut store = BackupStore::open_or_create(work.path().join("store")).unwrap();
+    store.store_file(&nginx_conf, "v1").unwrap();
+    store.store_file(&app_conf, "v1").unwrap();
+    store.save().unwrap();
+
+    // Adversary tampers with only one of them.
+    std::fs::write(&app_conf, b"debug = true ; backdoor").unwrap();
+
+    let outcome = ActiveResponseAction::RestoreBaseline
+        .execute(&app_conf, Some(&store))
+        .unwrap();
+    assert!(outcome.was_applied(), "{}", outcome.message());
+
+    assert_eq!(
+        std::fs::read(&app_conf).unwrap(),
+        b"debug = false",
+        "the tampered file was restored from the wrong backup"
+    );
+    assert_eq!(
+        std::fs::read(&nginx_conf).unwrap(),
+        b"listen 443 ssl;",
+        "an untouched file was overwritten by an unrelated restore"
+    );
+}
+
+/// A legacy flat backup directory must be refused outright, not silently treated as
+/// empty or, worse, used as-is.
+#[test]
+fn test_legacy_flat_backup_directory_is_refused() {
+    let work = tempfile::tempdir().unwrap();
+    let legacy = work.path().join("backups");
+    std::fs::create_dir_all(&legacy).unwrap();
+    std::fs::write(legacy.join("app.conf"), b"loose backup file").unwrap();
+
+    let err = BackupStore::open_or_create(&legacy).expect_err("legacy layout must be refused");
+    assert!(err.to_string().contains("legacy flat backup directory"));
 }
 
 #[test]

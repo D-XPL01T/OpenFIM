@@ -9,3 +9,11 @@
 .DS_Store
 Thumbs.db
 .cargo/mingw-compat/
+
+# Demo and test artifacts
+demo_sandbox/
+backup_store/
+
+# Backup stores (content-addressed pristine copies; may contain sensitive file content)
+**/backup_manifest.json
+**/objects/

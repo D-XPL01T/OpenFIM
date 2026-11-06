@@ -1,3 +1,4 @@
+pub mod backup;
 pub mod crawler;
 pub mod db;
 pub mod error;
@@ -8,6 +9,9 @@ pub mod policy;
 pub mod rate_limiter;
 pub mod whodata;
 
+pub use backup::{
+    BackupEntry, BackupManifest, BackupStore, RestoreOutcome, BACKUP_LAYOUT_VERSION, MANIFEST_FILE,
+};
 pub use crawler::{CrawlOptions, FileCrawler};
 pub use db::{
     compute_event_hmac_for, normalize_path_str, BaselineDb, BaselineDiff, ContentChange,

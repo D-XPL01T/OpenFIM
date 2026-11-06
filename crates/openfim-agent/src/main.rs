@@ -9,8 +9,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use clap::Parser;
 use openfim_common::notify::{self, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use openfim_common::{
-    BaselineDb, CompiledPolicy, FileMetadata, HashAlgorithm, Policy, PolicyRule, PolicyVerifier,
-    ProcessContext, RemediationGuard, SpoolEvent, StreamHasher, TokenBucket,
+    BackupStore, BaselineDb, CompiledPolicy, FileMetadata, HashAlgorithm, Policy, PolicyRule,
+    PolicyVerifier, ProcessContext, RemediationGuard, SpoolEvent, StreamHasher, TokenBucket,
     DEFAULT_MAX_REMEDIATIONS_PER_HOUR,
 };
 
@@ -182,6 +182,52 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("[*] Remediation mode: DISABLED (audit / alert only)");
     }
 
+    // Open the pristine-copy store once, up front, so a misconfigured path is reported
+    // at startup rather than discovered during an incident.
+    let backup_store = match args.backup_dir.as_deref() {
+        Some(dir) => match BackupStore::open_or_create(dir) {
+            Ok(store) => {
+                println!(
+                    "[*] Backup store: {} ({} pristine cop{} indexed)",
+                    dir.display(),
+                    store.len(),
+                    if store.len() == 1 { "y" } else { "ies" }
+                );
+                if store.is_empty() {
+                    println!(
+                        "[!] The backup store is empty, so restore_baseline cannot act. \
+                         Populate it with: openfim-cli baseline backup --db {} --out {}",
+                        args.db.display(),
+                        dir.display()
+                    );
+                }
+                Some(store)
+            }
+            Err(e) => {
+                // Do not fall back to "no store": that would silently turn a
+                // restore_baseline policy into alert-only without the operator knowing.
+                eprintln!("[!] Backup store unusable: {}", e);
+                if args.remediation {
+                    eprintln!(
+                        "[!] Refusing to start with --remediation and an unusable backup store. \
+                         Fix the store, or drop --remediation to run in alert-only mode."
+                    );
+                    std::process::exit(1);
+                }
+                None
+            }
+        },
+        None => {
+            if args.remediation {
+                println!(
+                    "[!] No --backup-dir given: restore_baseline rules will decline, \
+                     since there is no pristine copy to restore from."
+                );
+            }
+            None
+        }
+    };
+
     if !ProcessContext::attribution_available() {
         println!(
             "[!] Process attribution: UNAVAILABLE on this build. Alerts will record the \
@@ -265,7 +311,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let loop_cfg = SensorConfig {
         rate_bytes: rate_bytes_per_sec(args.throttle_mb_s),
         remediation: args.remediation,
-        backup_dir: args.backup_dir.clone(),
+        backup: backup_store,
         hmac_key,
     };
 
@@ -284,7 +330,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 struct SensorConfig {
     rate_bytes: u64,
     remediation: bool,
-    backup_dir: Option<PathBuf>,
+    /// Opened once at startup rather than per event: the store parses its index from
+    /// disk, which has no business happening inside the hot path.
+    backup: Option<BackupStore>,
     hmac_key: Vec<u8>,
 }
 
@@ -504,7 +552,7 @@ fn apply_remediation(
     if !cfg.remediation {
         return;
     }
-    match guard.execute(rule.active_response.action, path, cfg.backup_dir.as_deref()) {
+    match guard.execute(rule.active_response.action, path, cfg.backup.as_ref()) {
         Ok(outcome) => println!("    [REMEDIATION] {}", outcome),
         Err(e) => eprintln!("    [REMEDIATION] failed: {}", e),
     }

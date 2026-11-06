@@ -1524,6 +1524,32 @@ fn run_inprocess_sensor(
         }
     };
 
+    // Open the pristine-copy store once, before the loop, and report a bad path up
+    // front rather than mid-incident.
+    let backup_store = match backup_dir.filter(|d| !d.is_empty()) {
+        Some(dir) => match openfim_common::BackupStore::open_or_create(dir) {
+            Ok(store) => {
+                println!(
+                    "{}[*] Backup store: {} ({} pristine copies indexed){}",
+                    DIM,
+                    dir,
+                    store.len(),
+                    RESET
+                );
+                Some(store)
+            }
+            Err(e) => {
+                println!("{}[!] Backup store unusable: {}{}", RED, e, RESET);
+                println!(
+                    "{}[!] restore_baseline will decline rather than act on an unusable store.{}",
+                    YELLOW, RESET
+                );
+                None
+            }
+        },
+        None => None,
+    };
+
     let mut debounce = std::collections::HashMap::new();
     let rate_bytes = 50 * 1024 * 1024;
     let mut guard = openfim_common::RemediationGuard::new(if remediation {
@@ -1645,9 +1671,11 @@ fn run_inprocess_sensor(
                                 }
 
                                 if remediation {
-                                    let b_path = backup_dir.map(Path::new);
-                                    match guard.execute(rule.active_response.action, &path, b_path)
-                                    {
+                                    match guard.execute(
+                                        rule.active_response.action,
+                                        &path,
+                                        backup_store.as_ref(),
+                                    ) {
                                         Ok(outcome) => println!(
                                             "    {}[REMEDIATION] {}{}",
                                             GREEN, outcome, RESET

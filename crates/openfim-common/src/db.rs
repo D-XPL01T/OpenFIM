@@ -229,6 +229,53 @@ pub fn compute_event_hmac(
 pub const CHAIN_GENESIS_HMAC: &str =
     "0000000000000000000000000000000000000000000000000000000000000000";
 
+/// The canonical storage key for a monitored path: absolute where resolvable.
+///
+/// Paths reach OpenFIM in several spellings for the same file. A CLI crawl of
+/// `demo/data` yields relative paths; the real-time watcher reports absolute ones. Any
+/// store keyed on the raw spelling will therefore miss on lookup, which for the backup
+/// store means a restore silently finds nothing and declines. Absolutizing at write
+/// time makes the key stable regardless of how the path was first observed.
+pub fn canonical_path_key<P: AsRef<Path>>(path: P) -> String {
+    let path = path.as_ref();
+    if path.is_absolute() {
+        return normalize_path_str(path);
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => normalize_path_str(cwd.join(path)),
+        Err(_) => normalize_path_str(path),
+    }
+}
+
+/// Every normalized spelling a stored key might plausibly have for this path.
+///
+/// Returned in preference order: the caller's own spelling, the absolute form, then the
+/// working-directory-relative form. Used by lookups that must tolerate records written
+/// under a different spelling than the one being queried.
+pub fn path_lookup_candidates<P: AsRef<Path>>(path: P) -> Vec<String> {
+    let path = path.as_ref();
+    let mut candidates = Vec::with_capacity(3);
+
+    let as_given = normalize_path_str(path);
+    candidates.push(as_given.clone());
+
+    if let Ok(cwd) = std::env::current_dir() {
+        if path.is_relative() {
+            let abs = normalize_path_str(cwd.join(path));
+            if !candidates.contains(&abs) {
+                candidates.push(abs);
+            }
+        } else if let Ok(rel) = path.strip_prefix(&cwd) {
+            let rel = normalize_path_str(rel);
+            if !candidates.contains(&rel) {
+                candidates.push(rel);
+            }
+        }
+    }
+
+    candidates
+}
+
 /// Canonicalizes/normalizes a path string for consistent database keying across OS path separators
 pub fn normalize_path_str<P: AsRef<Path>>(p: P) -> String {
     let s = p.as_ref().to_string_lossy().replace('\\', "/");
@@ -1582,6 +1629,65 @@ mod tests {
             .diff_filesystem_scoped(&[], Some(Path::new("/etc")))
             .unwrap();
         assert_eq!(diff.removed.len(), 1);
+    }
+
+    // ---------------- Path keying ----------------
+
+    #[test]
+    fn test_canonical_key_is_absolute_for_relative_input() {
+        let key = canonical_path_key("some/relative/file.conf");
+        assert!(
+            Path::new(&key).is_absolute(),
+            "canonical key '{}' must be absolute so stores agree regardless of how the \
+             path was first observed",
+            key
+        );
+        assert!(key.ends_with("some/relative/file.conf"));
+        assert!(
+            !key.contains('\\'),
+            "separators must be normalized: {}",
+            key
+        );
+    }
+
+    #[test]
+    fn test_canonical_key_is_stable_for_absolute_input() {
+        let cwd = std::env::current_dir().unwrap();
+        let abs = cwd.join("a/b.conf");
+        assert_eq!(canonical_path_key(&abs), normalize_path_str(&abs));
+    }
+
+    #[test]
+    fn test_lookup_candidates_bridge_relative_and_absolute() {
+        let cwd = std::env::current_dir().unwrap();
+        let abs = cwd.join("etc/app.conf");
+
+        // Querying absolutely must offer the cwd-relative spelling too...
+        let from_abs = path_lookup_candidates(&abs);
+        assert!(from_abs.contains(&normalize_path_str(&abs)));
+        assert!(
+            from_abs.contains(&"etc/app.conf".to_string()),
+            "absolute query did not offer the relative spelling: {:?}",
+            from_abs
+        );
+
+        // ...and querying relatively must offer the absolute spelling.
+        let from_rel = path_lookup_candidates("etc/app.conf");
+        assert!(from_rel.contains(&"etc/app.conf".to_string()));
+        assert!(
+            from_rel.contains(&normalize_path_str(&abs)),
+            "relative query did not offer the absolute spelling: {:?}",
+            from_rel
+        );
+    }
+
+    #[test]
+    fn test_lookup_candidates_have_no_duplicates() {
+        let candidates = path_lookup_candidates("x.conf");
+        let mut unique = candidates.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(candidates.len(), unique.len(), "{:?}", candidates);
     }
 
     #[test]
