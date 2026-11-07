@@ -378,29 +378,50 @@ pub fn lint_policy(policy: &Policy, check_filesystem: bool) -> LintReport {
 
             // ---- Secrets and diff capture ----
 
-            if looks_like_secret(target) && !rule.nodiff {
+            // A secret-shaped path with `nodiff` left unset now defaults to suppressed,
+            // so the dangerous case is specifically an *explicit* opt-in to capturing
+            // the contents of something that looks like secret material.
+            if looks_like_secret(target) && rule.nodiff == Some(false) {
                 report.findings.push(
                     Finding::new(
                         Severity::Warning,
-                        "SECRET_WITHOUT_NODIFF",
+                        "SECRET_WITH_DIFF_ENABLED",
                         format!(
-                            "rule '{}' targets '{}', which looks like secret material, but \
-                             nodiff is false",
+                            "rule '{}' targets '{}', which looks like secret material, and \
+                             explicitly sets nodiff: false. Its contents will be written \
+                             into the event log.",
                             rule.id, target
                         ),
                     )
                     .for_rule(&rule.id)
                     .with_remedy(
-                        "set `nodiff: true` so file contents are never captured into the \
-                         event log",
+                        "remove `nodiff: false` to fall back to the safe default, or set \
+                         `nodiff: true` explicitly",
                     ),
+                );
+            } else if looks_like_secret(target) && rule.nodiff.is_none() {
+                report.findings.push(
+                    Finding::new(
+                        Severity::Info,
+                        "SECRET_NODIFF_DEFAULTED",
+                        format!(
+                            "rule '{}' targets '{}', which looks like secret material; diff \
+                             capture is suppressed by default",
+                            rule.id, target
+                        ),
+                    )
+                    .for_rule(&rule.id)
+                    .with_remedy("set `nodiff: true` explicitly to make the intent clear"),
                 );
             }
         }
 
         // ---- Active response ----
 
-        if rule.active_response.action == ActiveResponseAction::RestoreBaseline && rule.nodiff {
+        let suppresses_any_diff = rule.paths.iter().any(|p| rule.nodiff_effective(p));
+        if rule.active_response.action == ActiveResponseAction::RestoreBaseline
+            && suppresses_any_diff
+        {
             report.findings.push(
                 Finding::new(
                     Severity::Info,
@@ -553,7 +574,7 @@ mod tests {
             recursive: true,
             mode: RuleMode::Realtime,
             checks: RuleChecks::default(),
-            nodiff: false,
+            nodiff: None,
             ignore: vec![],
             severity: 5,
             whodata: false,
@@ -655,20 +676,33 @@ mod tests {
     }
 
     #[test]
-    fn secret_path_without_nodiff_is_flagged() {
-        let r = rule("R1", &["/etc/shadow"]);
-        assert!(
-            codes(&lint_policy(&policy_with(vec![r]), false)).contains(&"SECRET_WITHOUT_NODIFF")
-        );
+    fn explicitly_enabling_diffs_on_a_secret_path_is_a_warning() {
+        // The dangerous configuration is now an explicit opt-in, since leaving nodiff
+        // unset defaults to suppression.
+        let mut r = rule("R1", &["/etc/shadow"]);
+        r.nodiff = Some(false);
+        let report = lint_policy(&policy_with(vec![r]), false);
+        assert!(codes(&report).contains(&"SECRET_WITH_DIFF_ENABLED"));
+        assert!(!report.is_clean(), "this must fail a CI lint gate");
     }
 
     #[test]
-    fn secret_path_with_nodiff_is_not_flagged() {
+    fn secret_path_with_nodiff_unset_is_noted_as_defaulted() {
+        // Not a warning: the safe behaviour already applies. Worth saying so, because
+        // an operator should know the default is doing the work.
+        let r = rule("R1", &["/etc/shadow"]);
+        let report = lint_policy(&policy_with(vec![r]), false);
+        assert!(codes(&report).contains(&"SECRET_NODIFF_DEFAULTED"));
+        assert!(!codes(&report).contains(&"SECRET_WITH_DIFF_ENABLED"));
+    }
+
+    #[test]
+    fn secret_path_with_explicit_nodiff_is_not_flagged_at_all() {
         let mut r = rule("R1", &["/etc/shadow"]);
-        r.nodiff = true;
-        assert!(
-            !codes(&lint_policy(&policy_with(vec![r]), false)).contains(&"SECRET_WITHOUT_NODIFF")
-        );
+        r.nodiff = Some(true);
+        let report = lint_policy(&policy_with(vec![r]), false);
+        assert!(!codes(&report).contains(&"SECRET_WITH_DIFF_ENABLED"));
+        assert!(!codes(&report).contains(&"SECRET_NODIFF_DEFAULTED"));
     }
 
     #[test]
@@ -681,10 +715,11 @@ mod tests {
             "/secrets/db_password",
             "/vault/creds.kdbx",
         ] {
-            let r = rule("R1", &[path]);
+            let mut r = rule("R1", &[path]);
+            r.nodiff = Some(false);
             assert!(
                 codes(&lint_policy(&policy_with(vec![r]), false))
-                    .contains(&"SECRET_WITHOUT_NODIFF"),
+                    .contains(&"SECRET_WITH_DIFF_ENABLED"),
                 "{} was not recognized as secret material",
                 path
             );
@@ -694,10 +729,11 @@ mod tests {
     #[test]
     fn ordinary_paths_are_not_treated_as_secrets() {
         for path in ["/usr/bin", "/etc/hosts", "/var/www/index.html"] {
-            let r = rule("R1", &[path]);
+            let mut r = rule("R1", &[path]);
+            r.nodiff = Some(false);
+            let report = lint_policy(&policy_with(vec![r]), false);
             assert!(
-                !codes(&lint_policy(&policy_with(vec![r]), false))
-                    .contains(&"SECRET_WITHOUT_NODIFF"),
+                !codes(&report).contains(&"SECRET_WITH_DIFF_ENABLED"),
                 "{} was wrongly treated as secret material",
                 path
             );
@@ -722,18 +758,50 @@ mod tests {
 
     #[test]
     fn unenforceable_checks_are_reported_per_platform() {
-        // xattrs is unsupported everywhere in this build, so it must always be flagged.
+        // Asserted against whatever this platform genuinely cannot do, rather than a
+        // hardcoded example: the unsupported set shrinks as capture backends land, and
+        // this test must keep testing the mechanism rather than a snapshot of it.
         let mut r = rule("R1", &["/etc"]);
-        r.checks.xattrs = true;
+        r.checks = RuleChecks {
+            hash: true,
+            size: true,
+            permissions: true,
+            ownership: true,
+            timestamps: true,
+            attributes: true,
+            xattrs: true,
+        };
         let report = lint_policy(&policy_with(vec![r]), false);
         let findings: Vec<&Finding> = report
             .findings
             .iter()
             .filter(|f| f.code == "CHECK_UNENFORCEABLE")
             .collect();
-        assert!(!findings.is_empty());
+
+        let unsupported: Vec<Check> = Check::ALL
+            .iter()
+            .copied()
+            .filter(|&c| !support_for(c).is_active())
+            .collect();
+
+        assert_eq!(
+            findings.len(),
+            unsupported.len(),
+            "lint must flag exactly the checks this platform cannot enforce; \
+             unsupported: {:?}",
+            unsupported
+        );
+        for check in &unsupported {
+            assert!(
+                findings
+                    .iter()
+                    .any(|f| f.message.contains(check.field_name())),
+                "lint did not flag unenforceable check `{}`",
+                check
+            );
+        }
+        // Every finding must be actionable.
         assert!(findings.iter().all(|f| f.remedy.is_some()));
-        assert!(findings.iter().any(|f| f.message.contains("xattrs")));
     }
 
     #[test]

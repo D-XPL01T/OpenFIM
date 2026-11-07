@@ -607,6 +607,172 @@ rules:
     );
 }
 
+/// The gate on diff capture: a secret must never reach the database.
+///
+/// Diff capture is the one feature that makes OpenFIM write monitored file contents
+/// into its own storage. This test greps the entire database file, plus the event
+/// records, for the literal secret. It is the check that makes the feature acceptable
+/// to ship at all; without it, a monitor watching `.env` would copy exactly the
+/// material it exists to protect into an unencrypted SQLite file.
+#[test]
+fn test_secret_content_never_reaches_the_database() {
+    use openfim_common::{capture_for_rule, DiffOutcome, Policy};
+
+    const SECRET: &str = "ENCRYPTION_KEY=0xDEADBEEFCAFEBABE";
+
+    let dir = tempfile::tempdir().unwrap();
+    let secret_path = dir.path().join(".env");
+    std::fs::write(&secret_path, format!("{}\n", SECRET)).unwrap();
+
+    // A policy that does NOT mention nodiff at all. The unconfigured case must fail
+    // safe: this is the mistake a real operator makes.
+    let policy_yaml = format!(
+        r#"
+version: "1.0"
+policy_id: "secret-guard"
+name: "Secret Guard"
+author: "test"
+rules:
+  - id: "SECRETS"
+    description: "application secrets"
+    paths:
+      - "{}"
+    recursive: true
+    severity: 10
+"#,
+        dir.path().to_string_lossy().replace('\\', "/")
+    );
+    let policy = Policy::from_yaml_str(&policy_yaml).unwrap();
+    let rule = &policy.rules[0];
+
+    // Diff capture must refuse, by default, with no explicit nodiff anywhere.
+    let outcome = capture_for_rule(
+        rule,
+        &secret_path.to_string_lossy(),
+        b"ENCRYPTION_KEY=old\n",
+        format!("{}\n", SECRET).as_bytes(),
+    );
+    assert_eq!(
+        outcome,
+        DiffOutcome::SuppressedByPolicy,
+        "an unconfigured secret-shaped path was not suppressed; its contents would be \
+         written to the event log"
+    );
+    assert_eq!(outcome.diff(), None);
+
+    // Now drive a real event through the database with whatever the resolver produced,
+    // and confirm the secret appears nowhere in the file on disk.
+    let db_path = dir.path().join("fim.db");
+    let key = b"secret-guard-key";
+    {
+        let db = BaselineDb::open(&db_path).unwrap();
+        let mut ev = SpoolEvent {
+            sequence_id: None,
+            event_id: "evt-secret".to_string(),
+            timestamp_nano: 1,
+            event_type: "CONTENT_MUTATED".to_string(),
+            // Normalized exactly as the agent does, so the lookup below matches.
+            path: openfim_common::normalize_path_str(&secret_path),
+            severity: 10,
+            whodata_pid: None,
+            whodata_uid: None,
+            whodata_comm: None,
+            whodata_exe: None,
+            whodata_cmdline: None,
+            whodata_cgroup: None,
+            old_sha256: Some("a".repeat(64)),
+            new_sha256: Some("b".repeat(64)),
+            // Exactly what the agent records when suppression applies.
+            diff_snippet: Some(outcome.explain().to_string()),
+            hmac_signature: String::new(),
+            sent_to_manager: false,
+        };
+        db.append_spool_event_chained(&mut ev, key).unwrap();
+    }
+
+    // Read the raw database bytes, WAL included, and search for the secret.
+    let mut raw = std::fs::read(&db_path).unwrap_or_default();
+    for suffix in ["-wal", "-shm"] {
+        let side = db_path.with_file_name(format!(
+            "{}{}",
+            db_path.file_name().unwrap().to_string_lossy(),
+            suffix
+        ));
+        if let Ok(extra) = std::fs::read(&side) {
+            raw.extend_from_slice(&extra);
+        }
+    }
+
+    let haystack = String::from_utf8_lossy(&raw);
+    assert!(
+        !haystack.contains(SECRET),
+        "the secret appeared verbatim in the database file; diff suppression failed"
+    );
+    assert!(
+        !haystack.contains("DEADBEEFCAFEBABE"),
+        "secret material leaked into the database"
+    );
+
+    // And the event that was stored still explains why there is no diff, so the
+    // absence is documented rather than looking like an oversight.
+    let db = BaselineDb::open(&db_path).unwrap();
+    let events = db.get_events_for_path(&secret_path, 5).unwrap();
+    assert_eq!(events.len(), 1);
+    let snippet = events[0].diff_snippet.as_deref().unwrap_or("");
+    assert!(
+        snippet.contains("nodiff"),
+        "the suppressed event should say why no diff is present, got {:?}",
+        snippet
+    );
+}
+
+/// Non-secret paths still get a useful diff, so suppression has not simply disabled the
+/// feature everywhere.
+#[test]
+fn test_ordinary_paths_still_produce_a_bounded_diff() {
+    use openfim_common::{capture_for_rule, Policy, MAX_DIFF_BYTES};
+
+    let dir = tempfile::tempdir().unwrap();
+    let policy_yaml = format!(
+        r#"
+version: "1.0"
+policy_id: "diff-demo"
+name: "Diff Demo"
+author: "test"
+rules:
+  - id: "CONF"
+    description: "ordinary configuration"
+    paths:
+      - "{}"
+    recursive: true
+    severity: 5
+"#,
+        dir.path().to_string_lossy().replace('\\', "/")
+    );
+    let policy = Policy::from_yaml_str(&policy_yaml).unwrap();
+    let rule = &policy.rules[0];
+
+    let path = dir.path().join("nginx.conf");
+    let outcome = capture_for_rule(
+        rule,
+        &path.to_string_lossy(),
+        b"listen 80;\nserver_name example.com;\n",
+        b"listen 80;\nserver_name attacker.example;\n",
+    );
+
+    let diff = outcome
+        .diff()
+        .expect("an ordinary config file should produce a diff");
+    assert!(diff.contains("-server_name example.com"), "{}", diff);
+    assert!(diff.contains("+server_name attacker.example"), "{}", diff);
+    assert!(
+        !diff.contains("listen 80"),
+        "unchanged lines were copied needlessly: {}",
+        diff
+    );
+    assert!(diff.len() <= MAX_DIFF_BYTES + 80);
+}
+
 /// A legacy flat backup directory must be refused outright, not silently treated as
 /// empty or, worse, used as-is.
 #[test]

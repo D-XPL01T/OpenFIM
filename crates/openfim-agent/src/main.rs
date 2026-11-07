@@ -10,7 +10,7 @@ use clap::Parser;
 use openfim_common::notify::{self, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use openfim_common::{
     evaluate, reconcile, support_for, BackupStore, BaselineDb, ChangeKind, ChangeSet, Check,
-    CompiledPolicy, FileMetadata, HashAlgorithm, Policy, PolicyRule, PolicyVerifier,
+    CompiledPolicy, DiffOutcome, FileMetadata, HashAlgorithm, Policy, PolicyRule, PolicyVerifier,
     ProcessContext, RemediationGuard, RuleMode, SpoolEvent, StreamHasher, SweepReason, TokenBucket,
     DEFAULT_MAX_REMEDIATIONS_PER_HOUR, EVENT_HEARTBEAT, EVENT_SPOOL_PRUNED, EVENT_WATCH_OVERFLOW,
 };
@@ -824,6 +824,15 @@ fn record_bare_event(
     record_event(db, &mut spool, hmac_key);
 }
 
+/// Indents a multi-line block so a diff reads as part of the alert rather than as
+/// loose output that could be confused with the agent's own logging.
+fn indent_block(text: &str) -> String {
+    text.lines()
+        .map(|l| format!("      {}", l))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn unix_now_nanos() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -872,12 +881,43 @@ fn handle_path_event(
                 if !changes.is_clean() {
                     print_change_alert(path, rule.severity, &whodata, &changes);
 
+                    // Content diff, resolved once per path. `nodiff` is honoured inside
+                    // `resolve_diff`, before any file content is read into memory.
+                    let content_diff = if changes
+                        .changes
+                        .iter()
+                        .any(|c| matches!(c, ChangeKind::Content { .. }))
+                    {
+                        Some(resolve_diff(rule, path, cfg))
+                    } else {
+                        None
+                    };
+                    if let Some(ref outcome) = content_diff {
+                        match outcome.diff() {
+                            Some(text) => println!("    Diff:\n{}", indent_block(text)),
+                            None => println!("    Diff:       {}", outcome.explain()),
+                        }
+                    }
+
                     // Every observed difference is recorded separately, so the audit
                     // trail shows which controls fired rather than collapsing a
                     // content change and a permission change into one vague event.
                     for change in &changes.changes {
                         let mut spool =
                             create_spool_event_for(change, path, rule.severity, &whodata, ts_nano);
+
+                        // Attach the diff only to the content event, and only when one
+                        // was actually captured. Otherwise record the explanation, so an
+                        // absent diff is never mistaken for an absent change.
+                        if matches!(change, ChangeKind::Content { .. }) {
+                            if let Some(ref outcome) = content_diff {
+                                spool.diff_snippet = Some(match outcome.diff() {
+                                    Some(text) => text.to_string(),
+                                    None => outcome.explain().to_string(),
+                                });
+                            }
+                        }
+
                         record_event(db, &mut spool, &cfg.hmac_key);
                     }
 
@@ -1197,6 +1237,44 @@ fn create_spool_event_for(
     // authenticated by the event MAC, so it cannot be rewritten after the fact.
     event.diff_snippet = Some(change.describe());
     event
+}
+
+/// Resolves a content diff for a change, honouring `nodiff` before reading anything.
+///
+/// The previous bytes come from the backup store's pristine copy, which is the only
+/// place they exist: the baseline holds digests, not contents. With no store configured
+/// the result explains that rather than silently omitting the detail.
+///
+/// Suppression is consulted first, so for a `nodiff` path no file content is read into
+/// memory at all.
+fn resolve_diff(rule: &PolicyRule, path: &Path, cfg: &SensorConfig) -> DiffOutcome {
+    let path_str = path.to_string_lossy().to_string();
+
+    // Check policy before touching the file. For a nodiff path there is no window in
+    // which its contents exist destined for the database.
+    if rule.nodiff_effective(&path_str) {
+        return DiffOutcome::SuppressedByPolicy;
+    }
+
+    let store = match cfg.backup.as_ref() {
+        Some(s) => s,
+        None => return DiffOutcome::NoPreviousContent,
+    };
+    let entry = match store.lookup(path) {
+        Some(e) => e,
+        None => return DiffOutcome::NoPreviousContent,
+    };
+
+    let old = match std::fs::read(store.object_path(&entry.sha256)) {
+        Ok(bytes) => bytes,
+        Err(_) => return DiffOutcome::NoPreviousContent,
+    };
+    let new = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(_) => return DiffOutcome::NoPreviousContent,
+    };
+
+    openfim_common::capture_for_rule(rule, &path_str, &old, &new)
 }
 
 fn create_spool_event(

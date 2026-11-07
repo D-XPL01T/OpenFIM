@@ -31,9 +31,14 @@ libc = "0.2.169"
 # the unstable `windows_by_handle` feature, so they cannot be used on stable Rust.
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    # GetFileInformationByHandle, and FindFirstStreamW for alternate data streams.
     "Win32_Storage_FileSystem",
     # SetThreadPriority, for honouring globals.scan_nice_priority.
     "Win32_System_Threading",
+    # Security descriptors: the DACL is the real access control policy on Windows,
+    # and ownership is a SID rather than a numeric uid.
+    "Win32_Security",
+    "Win32_Security_Authorization",
 ] }
 
 [dev-dependencies]

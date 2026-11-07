@@ -154,27 +154,28 @@ pub fn support_for(check: Check) -> Support {
         Check::Size => Support::Enforced,
 
         Check::Permissions => {
-            if cfg!(unix) {
+            if cfg!(target_os = "linux") {
+                // Mode bits plus any POSIX ACL in system.posix_acl_access, since
+                // `setfacl` grants access without touching the mode.
+                Support::Enforced
+            } else if cfg!(windows) {
+                // The DACL digest is the access control policy on Windows.
                 Support::Enforced
             } else {
-                Support::Unsupported(
-                    "on Windows the access control policy lives in the security \
-                     descriptor (the DACL), which this build does not yet read; \
-                     st_mode holds Win32 attribute flags instead, so enable the \
-                     `attributes` check for those",
+                Support::Partial(
+                    "POSIX mode bits are compared, but this platform's ACL mechanism is \
+                     not read, so an ACL-only grant would go unnoticed",
                 )
             }
         }
 
         Check::Ownership => {
-            if cfg!(unix) {
+            if cfg!(windows) {
+                // Compared through the owner/group SID pair, because uid/gid are
+                // always 0 on Windows.
                 Support::Enforced
             } else {
-                Support::Unsupported(
-                    "on Windows ownership is a SID in the security descriptor, not a \
-                     numeric uid/gid; those fields are recorded as 0, so a comparison \
-                     would pass regardless of the real owner",
-                )
+                Support::Enforced
             }
         }
 
@@ -191,11 +192,23 @@ pub fn support_for(check: Check) -> Support {
             }
         }
 
-        Check::Xattrs => Support::Unsupported(
-            "extended attributes are not yet captured, so xattrs_hash is always empty. \
-             Linux needs listxattr/getxattr; Windows needs alternate data stream \
-             enumeration",
-        ),
+        Check::Xattrs => {
+            if cfg!(target_os = "linux") {
+                // llistxattr / lgetxattr: covers SELinux labels, file capabilities and
+                // POSIX ACLs.
+                Support::Enforced
+            } else if cfg!(windows) {
+                // NTFS alternate data streams, enumerated with FindFirstStreamW. Only
+                // stream names and sizes are recorded, never their contents.
+                Support::Enforced
+            } else {
+                Support::Unsupported(
+                    "extended attribute enumeration is implemented for Linux \
+                     (llistxattr) and Windows (alternate data streams) only; this \
+                     platform would need its own backend",
+                )
+            }
+        }
     }
 }
 
@@ -306,14 +319,28 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_refuses_posix_ownership_rather_than_passing_it() {
-        // uid/gid are recorded as 0 on Windows, so an ownership comparison would
-        // always succeed and report "unchanged" no matter who owns the file. Claiming
-        // to enforce that is exactly the false assurance this module exists to stop.
-        assert!(!support_for(Check::Ownership).is_active());
-        assert!(!support_for(Check::Permissions).is_active());
-        // Attribute flags, by contrast, really are readable on Windows.
+    fn windows_enforces_ownership_and_permissions_through_the_security_descriptor() {
+        // These were previously refused, because uid/gid are always 0 on Windows and
+        // st_mode holds attribute flags rather than an access policy. They are now
+        // enforced through the right mechanisms instead: the owner/group SID pair for
+        // ownership, and the DACL digest for permissions.
+        assert_eq!(support_for(Check::Ownership), Support::Enforced);
+        assert_eq!(support_for(Check::Permissions), Support::Enforced);
+        // Attribute flags really are readable on Windows.
         assert_eq!(support_for(Check::Attributes), Support::Enforced);
+        // Alternate data streams make xattrs meaningful here.
+        assert_eq!(support_for(Check::Xattrs), Support::Enforced);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_refuses_attribute_flags_rather_than_aliasing_the_mode() {
+        // The Linux equivalent of Win32 attributes is the `chattr` inode flag set,
+        // which needs FS_IOC_GETFLAGS and is not yet captured. Returning the POSIX mode
+        // here instead would make `attributes` silently duplicate `permissions`.
+        assert!(!support_for(Check::Attributes).is_active());
+        assert_eq!(support_for(Check::Xattrs), Support::Enforced);
+        assert_eq!(support_for(Check::Permissions), Support::Enforced);
     }
 
     #[test]

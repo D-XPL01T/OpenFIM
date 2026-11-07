@@ -394,7 +394,40 @@ impl BaselineDb {
             "#,
         )?;
 
+        self.migrate_schema()?;
+
         Ok(())
+    }
+
+    /// Applies additive column migrations to databases created by an earlier build.
+    ///
+    /// SQLite has no `ADD COLUMN IF NOT EXISTS`, so the column list is inspected first.
+    /// Adding columns rather than recreating the table keeps an existing baseline
+    /// usable: silently discarding a baseline on upgrade would leave the host
+    /// unmonitored until someone noticed and re-snapshotted it.
+    fn migrate_schema(&self) -> Result<()> {
+        let existing = self.column_names("baseline_entries")?;
+
+        // owner_id carries the Windows owner SID, which has no numeric equivalent.
+        if !existing.iter().any(|c| c == "owner_id") {
+            self.conn
+                .execute_batch("ALTER TABLE baseline_entries ADD COLUMN owner_id TEXT")?;
+        }
+
+        Ok(())
+    }
+
+    /// Column names of a table, for migration checks.
+    fn column_names(&self, table: &str) -> Result<Vec<String>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM pragma_table_info(?1)")?;
+        let rows = stmt.query_map([table], |row| row.get::<_, String>(0))?;
+        let mut names = Vec::new();
+        for r in rows {
+            names.push(r?);
+        }
+        Ok(names)
     }
 
     /// Reads the persisted chain anchor, if one exists.
@@ -424,8 +457,8 @@ impl BaselineDb {
             INSERT OR REPLACE INTO baseline_entries (
                 path, sha256, blake3, file_size, mode, uid, gid, inode, dev, nlink,
                 mtime, mtime_nsec, ctime, xattrs_hash, acl_hash, symlink_target,
-                is_symlink, is_dir, manifest_version, created_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                is_symlink, is_dir, manifest_version, created_at, owner_id
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
             "#,
             params![
                 path_str,
@@ -448,6 +481,7 @@ impl BaselineDb {
                 entry.is_dir as i32,
                 manifest_version,
                 now,
+                entry.owner_id,
             ],
         )?;
 
@@ -473,8 +507,8 @@ impl BaselineDb {
                 INSERT OR REPLACE INTO baseline_entries (
                     path, sha256, blake3, file_size, mode, uid, gid, inode, dev, nlink,
                     mtime, mtime_nsec, ctime, xattrs_hash, acl_hash, symlink_target,
-                    is_symlink, is_dir, manifest_version, created_at
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)
+                    is_symlink, is_dir, manifest_version, created_at, owner_id
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)
                 "#,
             )?;
 
@@ -501,6 +535,7 @@ impl BaselineDb {
                     entry.is_dir as i32,
                     manifest_version,
                     now,
+                    entry.owner_id,
                 ])?;
             }
         }
@@ -536,7 +571,8 @@ impl BaselineDb {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT path, sha256, blake3, file_size, mode, uid, gid, inode, dev, nlink,
-                   mtime, mtime_nsec, ctime, xattrs_hash, acl_hash, symlink_target, is_symlink, is_dir
+                   mtime, mtime_nsec, ctime, xattrs_hash, acl_hash, symlink_target, is_symlink, is_dir,
+                   owner_id
             FROM baseline_entries WHERE path = ?1 OR path = ?2 OR path = ?3
             -- Deterministic preference: the caller's own spelling first, then the
             -- absolute form, then the working-directory-relative form. Without this
@@ -569,6 +605,7 @@ impl BaselineDb {
                 symlink_target: row.get(15)?,
                 is_symlink: row.get::<_, i32>(16)? == 1,
                 is_dir: row.get::<_, i32>(17)? == 1,
+                owner_id: row.get(18)?,
             }))
         } else {
             Ok(None)
@@ -634,7 +671,8 @@ impl BaselineDb {
         let mut stmt = self.conn.prepare(
             r#"
             SELECT path, sha256, blake3, file_size, mode, uid, gid, inode, dev, nlink,
-                   mtime, mtime_nsec, ctime, xattrs_hash, acl_hash, symlink_target, is_symlink, is_dir
+                   mtime, mtime_nsec, ctime, xattrs_hash, acl_hash, symlink_target, is_symlink, is_dir,
+                   owner_id
             FROM baseline_entries
             "#,
         )?;
@@ -661,6 +699,7 @@ impl BaselineDb {
                 symlink_target: row.get(15)?,
                 is_symlink: row.get::<_, i32>(16)? == 1,
                 is_dir: row.get::<_, i32>(17)? == 1,
+                owner_id: row.get(18)?,
             })
         })?;
 
@@ -1232,6 +1271,7 @@ mod tests {
             blake3: None,
             xattrs_hash: None,
             acl_hash: None,
+            owner_id: None,
             symlink_target: None,
             is_symlink: false,
             is_dir: false,

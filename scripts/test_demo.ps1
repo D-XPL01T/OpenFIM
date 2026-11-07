@@ -82,7 +82,12 @@ rules:
       - "$demoDir/data"
     recursive: true
     mode: "realtime"
-    nodiff: false
+    # nodiff is deliberately left unset. The monitored file is a .env holding an
+    # encryption key, so the safe default applies and its contents are never written
+    # into the event log. Setting 'nodiff: false' here would opt that secret into diff
+    # capture, which is exactly what 'openfim-cli policy lint' warns about.
+    # (No backticks in this block: inside a PowerShell here-string a backtick is the
+    # escape character, so 'n' after one would become a literal newline.)
     whodata: true
     severity: 10
     checks:

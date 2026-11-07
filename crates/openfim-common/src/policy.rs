@@ -385,8 +385,15 @@ pub struct PolicyRule {
     #[serde(default)]
     pub checks: RuleChecks,
 
-    #[serde(default = "default_false")]
-    pub nodiff: bool,
+    /// Whether to suppress content diff capture for this rule.
+    ///
+    /// Tri-state on purpose. `None` means the operator did not say, and
+    /// [`PolicyRule::nodiff_effective`] then fails **safe** by suppressing diffs for
+    /// paths that look like secret material. A plain `bool` could not distinguish
+    /// "unset" from "explicitly false", so forgetting the field would silently opt a
+    /// path like `/etc/shadow` into having its contents written to the event log.
+    #[serde(default)]
+    pub nodiff: Option<bool>,
 
     #[serde(default)]
     pub ignore: Vec<String>,
@@ -399,6 +406,70 @@ pub struct PolicyRule {
 
     #[serde(default)]
     pub active_response: ActiveResponseConfig,
+}
+
+/// Filename fragments that very likely indicate secret material.
+///
+/// Used only to decide the **default** for `nodiff`, never to exclude anything from
+/// monitoring. A false positive here costs a missing diff; a false negative would cost
+/// a secret written into the event log, so the list errs towards suppression.
+pub const SECRET_PATH_HINTS: &[&str] = &[
+    "shadow",
+    "gshadow",
+    ".key",
+    ".pem",
+    ".p12",
+    ".pfx",
+    "id_rsa",
+    "id_dsa",
+    "id_ecdsa",
+    "id_ed25519",
+    ".env",
+    "credential",
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    ".kdbx",
+    ".keystore",
+    ".jks",
+    "htpasswd",
+];
+
+/// True when a path looks like it holds secret material.
+pub fn path_looks_secret(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    SECRET_PATH_HINTS.iter().any(|hint| lower.contains(hint))
+}
+
+impl PolicyRule {
+    /// Whether diff capture is suppressed for a given path under this rule.
+    ///
+    /// An explicit setting always wins. When unset, secret-shaped paths are suppressed,
+    /// so the unconfigured case cannot leak file contents into the database.
+    pub fn nodiff_effective(&self, path: &str) -> bool {
+        match self.nodiff {
+            Some(explicit) => explicit,
+            None => path_looks_secret(path),
+        }
+    }
+
+    /// Whether the operator stated `nodiff` explicitly, for diagnostics.
+    pub fn nodiff_is_explicit(&self) -> bool {
+        self.nodiff.is_some()
+    }
+
+    /// Display form of the effective setting, naming where it came from.
+    pub fn nodiff_description(&self, path: &str) -> String {
+        match self.nodiff {
+            Some(true) => "true (explicit)".to_string(),
+            Some(false) => "false (explicit)".to_string(),
+            None if path_looks_secret(path) => {
+                "true (default: path looks like secret material)".to_string()
+            }
+            None => "false (default)".to_string(),
+        }
+    }
 }
 
 /// Complete declarative OpenFIM Policy
@@ -1162,7 +1233,7 @@ rules:
         let r1 = &policy.rules[0];
         assert_eq!(r1.id, "ETC_AUTH_CRITICAL");
         assert_eq!(r1.severity, 10);
-        assert!(r1.nodiff);
+        assert_eq!(r1.nodiff, Some(true));
         assert!(r1.checks.hash);
         assert!(!r1.checks.timestamps);
         assert_eq!(r1.active_response.action, ActiveResponseAction::None);
@@ -1177,7 +1248,7 @@ rules:
         // Check Rule 3
         let r3 = &policy.rules[2];
         assert_eq!(r3.id, "SSH_AUTHORIZED_KEYS");
-        assert!(!r3.nodiff);
+        assert_eq!(r3.nodiff, Some(false));
         assert_eq!(
             r3.active_response.action,
             ActiveResponseAction::RestoreBaseline
@@ -1231,7 +1302,7 @@ rules:
             .find_matching_rule(Path::new("/etc/shadow"))
             .expect("Should match");
         assert_eq!(r_shadow.id, "ETC_AUTH_CRITICAL");
-        assert!(r_shadow.nodiff);
+        assert_eq!(r_shadow.nodiff, Some(true));
 
         // 2. /usr/bin/curl should match SYSTEM_BINARIES_IMMUTABLE
         let r_bin = policy
@@ -1270,7 +1341,7 @@ rules:
                 recursive: true,
                 mode: RuleMode::default(),
                 checks: RuleChecks::default(),
-                nodiff: false,
+                nodiff: None,
                 ignore: ignore.iter().map(|s| s.to_string()).collect(),
                 severity: 7,
                 whodata: true,
@@ -1317,7 +1388,7 @@ rules:
             recursive: true,
             mode: RuleMode::default(),
             checks: RuleChecks::default(),
-            nodiff: false,
+            nodiff: None,
             ignore: vec![],
             severity: 1,
             whodata: true,

@@ -277,7 +277,7 @@ mod tests {
                     attributes: false,
                     xattrs: false,
                 },
-                nodiff: false,
+                nodiff: None,
                 ignore: vec![],
                 severity: 9,
                 whodata: false,

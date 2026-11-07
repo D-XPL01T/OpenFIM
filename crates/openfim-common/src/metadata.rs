@@ -41,6 +41,13 @@ pub struct FileMetadata {
     pub blake3: Option<String>,
     pub xattrs_hash: Option<String>,
     pub acl_hash: Option<String>,
+    /// Platform-native owner identity, where numeric uid/gid are not meaningful.
+    ///
+    /// Holds the `owner-SID:group-SID` pair on Windows and `None` on Unix. Without it,
+    /// ownership monitoring is impossible on Windows: `st_uid`/`st_gid` are always 0
+    /// there, so comparing them would report "unchanged" whoever owns the file.
+    #[serde(default)]
+    pub owner_id: Option<String>,
     pub symlink_target: Option<String>,
     pub is_symlink: bool,
     pub is_dir: bool,
@@ -115,6 +122,16 @@ impl FileMetadata {
         // the hasher's TOCTOU check and the crawler's cycle detection agree with it.
         let identity = fsident::identity_from_metadata_and_path(&meta, path_ref);
 
+        // Security-relevant state that a content hash cannot see: extended attributes
+        // (SELinux labels, file capabilities, NTFS alternate data streams), the access
+        // control policy, and the platform-native owner identity.
+        //
+        // Directories are included: a `system.posix_acl_default` change silently alters
+        // the permissions of everything created in the directory afterwards.
+        let xattrs_hash = crate::xattr::hash_path_attributes(path_ref);
+        let acl_hash = crate::acl::hash_access_control(path_ref);
+        let owner_id = crate::acl::owner_identity(path_ref);
+
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -133,8 +150,9 @@ impl FileMetadata {
                 st_btime: None,
                 sha256,
                 blake3,
-                xattrs_hash: None,
-                acl_hash: None,
+                xattrs_hash,
+                acl_hash,
+                owner_id,
                 symlink_target,
                 is_symlink,
                 is_dir,
@@ -167,8 +185,9 @@ impl FileMetadata {
                 st_btime: Some(ctime),
                 sha256,
                 blake3,
-                xattrs_hash: None,
-                acl_hash: None,
+                xattrs_hash,
+                acl_hash,
+                owner_id,
                 symlink_target,
                 is_symlink,
                 is_dir,
@@ -192,8 +211,9 @@ impl FileMetadata {
                 st_btime: None,
                 sha256,
                 blake3,
-                xattrs_hash: None,
-                acl_hash: None,
+                xattrs_hash,
+                acl_hash,
+                owner_id,
                 symlink_target,
                 is_symlink,
                 is_dir,

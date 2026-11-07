@@ -1055,7 +1055,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             rule.severity,
                             rule.id,
                             rule.mode,
-                            rule.nodiff,
+                            rule.nodiff
+                                .map(|v| v.to_string())
+                                .unwrap_or_else(|| "unset (safe default)".to_string()),
                             rule.active_response.action
                         );
                     }
@@ -1250,7 +1252,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!("  Description:     {}", rule.description);
                         println!("  Severity:        {}/10", rule.severity);
                         println!("  Mode:            {:?}", rule.mode);
-                        println!("  NoDiff (Secret): {}", rule.nodiff);
+                        println!(
+                            "  NoDiff (Secret): {}",
+                            rule.nodiff_description(&path.to_string_lossy())
+                        );
                         println!("  WhoData:         {}", rule.whodata);
                         println!("  Active Response: {:?}", rule.active_response.action);
                         println!(

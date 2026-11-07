@@ -1,8 +1,10 @@
+pub mod acl;
 pub mod backup;
 pub mod capabilities;
 pub mod crawler;
 pub mod db;
 pub mod detect;
+pub mod diff;
 pub mod error;
 pub mod fsident;
 pub mod hasher;
@@ -12,7 +14,9 @@ pub mod policy;
 pub mod rate_limiter;
 pub mod sweep;
 pub mod whodata;
+pub mod xattr;
 
+pub use acl::{hash_access_control, owner_identity, uses_string_owner_identity};
 pub use backup::{
     BackupEntry, BackupManifest, BackupStore, RestoreOutcome, BACKUP_LAYOUT_VERSION, MANIFEST_FILE,
 };
@@ -25,6 +29,7 @@ pub use db::{
     MetadataChange, SpoolAuditReport, SpoolEvent, CHAIN_GENESIS_HMAC,
 };
 pub use detect::{evaluate, ChangeKind, ChangeSet, SkippedCheck};
+pub use diff::{capture_for_rule, DiffOutcome, MAX_DIFF_BYTES};
 pub use ed25519_dalek;
 pub use error::{OpenFimError, Result};
 pub use fsident::FsIdentity;
@@ -36,9 +41,9 @@ pub use metadata::{
 };
 pub use notify;
 pub use policy::{
-    ActiveResponseAction, ActiveResponseConfig, CompiledPolicy, Policy, PolicyGlobals, PolicyRule,
-    PolicySigner, PolicyVerifier, RemediationGuard, RemediationOutcome, RuleChecks, RuleMode,
-    DEFAULT_MAX_REMEDIATIONS_PER_HOUR,
+    path_looks_secret, ActiveResponseAction, ActiveResponseConfig, CompiledPolicy, Policy,
+    PolicyGlobals, PolicyRule, PolicySigner, PolicyVerifier, RemediationGuard, RemediationOutcome,
+    RuleChecks, RuleMode, DEFAULT_MAX_REMEDIATIONS_PER_HOUR,
 };
 pub use rate_limiter::TokenBucket;
 pub use sweep::{
@@ -46,3 +51,4 @@ pub use sweep::{
     EVENT_SPOOL_PRUNED, EVENT_SWEEP_FOUND, EVENT_WATCH_OVERFLOW,
 };
 pub use whodata::ProcessContext;
+pub use xattr::{hash_path_attributes, ExtendedAttribute};

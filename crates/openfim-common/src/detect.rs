@@ -60,6 +60,16 @@ pub enum ChangeKind {
         old: Option<String>,
         new: Option<String>,
     },
+    /// The access control list differs: a POSIX ACL on Unix, the DACL on Windows.
+    Acl {
+        old: Option<String>,
+        new: Option<String>,
+    },
+    /// The platform-native owner identity differs (the Windows owner/group SID pair).
+    OwnerIdentity {
+        old: Option<String>,
+        new: Option<String>,
+    },
     /// The file was replaced by a different filesystem object, or vice versa.
     ///
     /// Detected independently of the requested checks, because a path that now names a
@@ -94,6 +104,8 @@ impl ChangeKind {
             ChangeKind::Timestamps { .. } => "TIMESTAMP_CHANGED",
             ChangeKind::Attributes { .. } => "ATTRIBUTES_CHANGED",
             ChangeKind::Xattrs { .. } => "XATTRS_CHANGED",
+            ChangeKind::Acl { .. } => "ACL_CHANGED",
+            ChangeKind::OwnerIdentity { .. } => "OWNERSHIP_CHANGED",
             ChangeKind::IdentityChanged { .. } => "FILE_REPLACED",
             ChangeKind::KindChanged { .. } => "FILE_KIND_CHANGED",
             ChangeKind::SymlinkTargetChanged { .. } => "SYMLINK_RETARGETED",
@@ -115,6 +127,8 @@ impl ChangeKind {
             ChangeKind::Permissions { .. } => 70,
             ChangeKind::Ownership { .. } => 65,
             ChangeKind::Xattrs { .. } => 60,
+            ChangeKind::Acl { .. } => 72,
+            ChangeKind::OwnerIdentity { .. } => 66,
             ChangeKind::Attributes { .. } => 55,
             ChangeKind::Size { .. } => 50,
             ChangeKind::Timestamps { .. } => 20,
@@ -166,6 +180,16 @@ impl ChangeKind {
                 format!("attribute flags changed: 0x{:x} -> 0x{:x}", old, new)
             }
             ChangeKind::Xattrs { .. } => "extended attributes changed".to_string(),
+            ChangeKind::Acl { old, new } => format!(
+                "access control list changed: {} -> {}",
+                old.as_deref().unwrap_or("(none)"),
+                new.as_deref().unwrap_or("(none)")
+            ),
+            ChangeKind::OwnerIdentity { old, new } => format!(
+                "owner changed: {} -> {}",
+                old.as_deref().unwrap_or("(unknown)"),
+                new.as_deref().unwrap_or("(unknown)")
+            ),
             ChangeKind::IdentityChanged {
                 old_dev,
                 old_ino,
@@ -354,10 +378,20 @@ pub fn evaluate(baseline: &FileMetadata, current: &FileMetadata, checks: &RuleCh
     // permission bits; on Windows it holds Win32 attribute flags and the real access
     // control policy is in the DACL, which is why `permissions` is unsupported there.
     if note_if_unsupported(Check::Permissions, checks.permissions, skipped) {
+        // On Unix the policy is the mode bits *plus* any POSIX ACL: `setfacl -m
+        // u:attacker:rw` grants access while leaving the mode, owner and contents
+        // untouched. On Windows the mode bits are not a policy at all and the DACL
+        // digest is the whole answer.
         if let (Some(old), Some(new)) = (baseline.permission_bits(), current.permission_bits()) {
             if old != new {
                 set.changes.push(ChangeKind::Permissions { old, new });
             }
+        }
+        if baseline.acl_hash != current.acl_hash {
+            set.changes.push(ChangeKind::Acl {
+                old: baseline.acl_hash.clone(),
+                new: current.acl_hash.clone(),
+            });
         }
     }
 
@@ -369,15 +403,25 @@ pub fn evaluate(baseline: &FileMetadata, current: &FileMetadata, checks: &RuleCh
         }
     }
 
-    if note_if_unsupported(Check::Ownership, checks.ownership, skipped)
-        && (baseline.st_uid != current.st_uid || baseline.st_gid != current.st_gid)
-    {
-        set.changes.push(ChangeKind::Ownership {
-            old_uid: baseline.st_uid,
-            new_uid: current.st_uid,
-            old_gid: baseline.st_gid,
-            new_gid: current.st_gid,
-        });
+    if note_if_unsupported(Check::Ownership, checks.ownership, skipped) {
+        if crate::acl::uses_string_owner_identity() {
+            // Windows: uid/gid are always 0, so the SID pair is the only thing that can
+            // actually change. Comparing the numeric fields here would report
+            // "unchanged" whoever owns the file.
+            if baseline.owner_id != current.owner_id {
+                set.changes.push(ChangeKind::OwnerIdentity {
+                    old: baseline.owner_id.clone(),
+                    new: current.owner_id.clone(),
+                });
+            }
+        } else if baseline.st_uid != current.st_uid || baseline.st_gid != current.st_gid {
+            set.changes.push(ChangeKind::Ownership {
+                old_uid: baseline.st_uid,
+                new_uid: current.st_uid,
+                old_gid: baseline.st_gid,
+                new_gid: current.st_gid,
+            });
+        }
     }
 
     if note_if_unsupported(Check::Timestamps, checks.timestamps, skipped)
@@ -427,6 +471,7 @@ mod tests {
             blake3: None,
             xattrs_hash: None,
             acl_hash: None,
+            owner_id: None,
             symlink_target: None,
             is_symlink: false,
             is_dir: false,
@@ -619,18 +664,35 @@ mod tests {
 
     #[test]
     fn unsupported_requested_check_is_reported_not_silently_passed() {
-        // The core honesty property. `xattrs` cannot be compared in this build, so
-        // asking for it must yield a recorded skip rather than a clean verdict.
+        // The core honesty property, asserted against whatever this platform cannot
+        // actually do rather than against a hardcoded example — the set shrinks as
+        // capture backends land, and this test must keep testing the mechanism.
         let base = meta("/etc/passwd");
         let set = evaluate(&base, &base.clone(), &all_checks());
 
-        assert!(
-            set.skipped_unsupported
-                .iter()
-                .any(|s| s.check == Check::Xattrs),
-            "requesting an unsupported check must be reported: {:?}",
+        let unsupported: Vec<Check> = Check::ALL
+            .iter()
+            .copied()
+            .filter(|&c| !crate::capabilities::support_for(c).is_active())
+            .collect();
+
+        assert_eq!(
+            set.skipped_unsupported.len(),
+            unsupported.len(),
+            "every check this platform cannot perform must be reported as skipped; \
+             unsupported here: {:?}, reported: {:?}",
+            unsupported,
             set.skipped_unsupported
         );
+
+        for check in unsupported {
+            assert!(
+                set.skipped_unsupported.iter().any(|s| s.check == check),
+                "requesting unsupported check {} was not reported",
+                check
+            );
+        }
+
         for skip in &set.skipped_unsupported {
             assert!(
                 !skip.reason.is_empty(),
@@ -688,20 +750,47 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn windows_reports_permissions_as_unsupported_rather_than_comparing_st_mode() {
-        // On Windows st_mode holds attribute flags, not an access control policy.
-        // Comparing it under the name "permissions" would tell the operator their ACLs
-        // are monitored when they are not.
+    fn windows_compares_the_dacl_not_st_mode_for_permissions() {
+        // st_mode on Windows holds attribute flags, not an access policy, so
+        // permissions is compared through the DACL digest. A changed DACL with
+        // identical attribute bits must still be reported.
         let base = meta("C:/data/app.conf");
-        let set = evaluate(&base, &base.clone(), &all_checks());
-        assert!(set
-            .skipped_unsupported
-            .iter()
-            .any(|s| s.check == Check::Permissions));
-        assert!(set
-            .skipped_unsupported
-            .iter()
-            .any(|s| s.check == Check::Ownership));
+        let mut cur = base.clone();
+        cur.acl_hash = Some("dacl-after-granting-everyone-full-control".to_string());
+
+        let set = evaluate(&base, &cur, &all_checks());
+        assert!(
+            set.event_types().contains(&"ACL_CHANGED"),
+            "a DACL change was not detected: {:?}",
+            set.event_types()
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_compares_the_owner_sid_not_numeric_ids() {
+        // uid/gid are always 0 on Windows, so changing them cannot happen and
+        // comparing them would report "unchanged" whoever owns the file.
+        let base = meta("C:/data/app.conf");
+
+        let mut sid_changed = base.clone();
+        sid_changed.owner_id = Some("S-1-5-21-0-0-0-1001:S-1-5-32-544".to_string());
+        assert!(
+            evaluate(&base, &sid_changed, &all_checks())
+                .event_types()
+                .contains(&"OWNERSHIP_CHANGED"),
+            "an owner SID change was not detected"
+        );
+
+        // And the numeric fields are correctly ignored on this platform.
+        let mut numeric_changed = base.clone();
+        numeric_changed.st_uid = 4242;
+        assert!(
+            !evaluate(&base, &numeric_changed, &all_checks())
+                .event_types()
+                .contains(&"OWNERSHIP_CHANGED"),
+            "numeric uid was compared on Windows, where it is always 0"
+        );
     }
 
     #[cfg(windows)]

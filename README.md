@@ -58,17 +58,18 @@ Legend: **✅ enforced** · **◐ partial** · **❌ unsupported on this platfor
 | `checks.hash` | ✅ | ✅ | ✅ | |
 | `checks.size` | ✅ | ✅ | ✅ | Enforced independently of `hash`, so it still fires with hashing disabled. |
 | `checks.timestamps` | ✅ | ✅ | ✅ | Sub-second precision; defaults to off, since mtime churn is noisy. |
-| `checks.permissions` | ✅ | ❌ | ✅ | POSIX mode bits, masked to exclude file-type bits. Refused on Windows, where the access policy is in the DACL — ACL hashing is plan §18.3.2. |
-| `checks.ownership` | ✅ | ❌ | ✅ | Refused on Windows rather than silently passing: `uid`/`gid` are always 0 there, so a comparison would succeed regardless of the real owner. |
+| `checks.permissions` | ✅ | ✅ | ◐ | POSIX mode bits plus the `system.posix_acl_access` ACL on Linux; the DACL digest on Windows. macOS compares mode bits only. |
+| `checks.ownership` | ✅ | ✅ | ✅ | `uid`/`gid` on Unix; the owner/group SID pair on Windows, since `uid`/`gid` are always 0 there. |
 | `checks.attributes` | ❌ | ✅ | ❌ | Win32 attribute flags. Refused on Unix, where the equivalent inode flags (`chattr`) are not yet captured. |
-| `checks.xattrs` | ⬜ | ⬜ | ⬜ | Not yet captured, so requesting it is reported as a skipped check rather than a pass. |
+| `checks.xattrs` | ✅ | ✅ | ❌ | `llistxattr` on Linux (SELinux labels, file capabilities, POSIX ACLs); NTFS alternate data streams on Windows, recording names and sizes only, never contents. |
 | `globals.default_hash` | ✅ | ✅ | ✅ | Drives the hasher; `policy check` shows the effective value and its source. |
 | `globals.max_io_rate_mb_s` | ✅ | ✅ | ✅ | `--throttle-mb-s` overrides it; precedence is reported at startup. |
 | `globals.max_spool_mb` | ✅ | ✅ | ✅ | Disk quota (RSK-03). Prunes only already-forwarded events, lowest severity first, and records a chained `SPOOL_PRUNED` event. |
 | `globals.scan_nice_priority` | ✅ | ✅ | ◐ | `setpriority` on Unix, `SetThreadPriority` on Windows. A failure to apply is reported, not swallowed. |
 | `globals.realtime_fallback_sweep_interval` | ✅ | ✅ | ✅ | Drives the reconciliation sweep. Set to 0 to disable, which the daemon and `policy lint` both warn about. |
 | `rule.mode` (`scheduled` / `on_boot`) | ✅ | ✅ | ✅ | Only `realtime` rules get a kernel watch; the others are covered by the sweep. |
-| `rule.nodiff` | ⬜ | ⬜ | ⬜ | Moot until diff capture exists (plan §18.3.5). `policy lint` warns on secret-shaped paths. |
+| `rule.nodiff` | ✅ | ✅ | ✅ | Tri-state: unset defaults to **suppressed** for secret-shaped paths, so forgetting it fails safe. Suppression is applied before any content is read. |
+| Content diff capture | ✅ | ✅ | ✅ | Bounded to 4 KB, binary content refused, unchanged context omitted. Previous bytes come from the backup store; without one, the absence is explained. |
 | Unknown policy fields rejected | ✅ | ✅ | ✅ | A typo such as `cheks:` is a parse error listing the valid fields, not a silently-defaulted control. |
 | `policy lint` | ✅ | ✅ | ✅ | 16 checks for configuration that parses but will not act; exits non-zero so it can gate CI. |
 | `policy capabilities` | ✅ | ✅ | ✅ | Prints this matrix for the running platform. |
@@ -77,10 +78,12 @@ Legend: **✅ enforced** · **◐ partial** · **❌ unsupported on this platfor
 | Package-manager change intelligence | ⬜ | ⬜ | ⬜ | Roadmap Phase 2. |
 | TPM 2.0 key sealing | ⬜ | ⬜ | ⬜ | Roadmap Phase 3. |
 
-**17 of 19 policy fields are now enforced, or explicitly refused with a reason.** The
-two still outstanding are `checks.xattrs` and `rule.nodiff`, tracked in
-[`18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md`](file:///d:/VibeCode/file_integrity/docs/18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md)
-§18.3.2, §18.3.4 and §18.3.5.
+**Every one of the 19 policy fields is now either enforced, or explicitly refused with
+a stated reason.** The two refusals are `checks.attributes` on Unix (the `chattr` inode
+flag set is not captured, and aliasing it to the POSIX mode would silently duplicate
+`checks.permissions`) and `rule.whodata` (attribution needs kernel support). Both are
+tracked in
+[`18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md`](file:///d:/VibeCode/file_integrity/docs/18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md).
 
 A ❌ in the matrix is not an oversight. It means the control is **refused with a stated
 reason** rather than quietly comparing fields that cannot change — `policy lint` reports
@@ -98,10 +101,12 @@ Read this before deploying OpenFIM anywhere you care about.
   This is the main capability that distinguishes a FIM from a checksum script, and it
   requires kernel support that is not yet implemented. Alerts say `UNATTRIBUTED` rather
   than guessing.
-- **Two policy fields are still not enforced** (`checks.xattrs` and `rule.nodiff`).
-  Requesting either is now reported — by `policy lint`, by the daemon at startup, and
-  in each verdict — rather than passing silently. `rule.whodata` is likewise reported
-  as unavailable, since attribution needs kernel support.
+- **Two controls are refused rather than enforced**: `checks.attributes` on Unix, and
+  `rule.whodata` everywhere. Requesting either is reported — by `policy lint`, by the
+  daemon at startup, and in each verdict — rather than passing silently.
+- **ACL monitoring is a digest, not an explanation.** OpenFIM can tell you the access
+  control policy on a file changed; it cannot tell you which entry changed. Parsing
+  security descriptors on the scanning path was judged not worth the attack surface.
 - **Real-time monitoring can still miss events, but no longer silently.** The watcher
   drops events under load (inotify queue overflow, `ReadDirectoryChangesW` buffer
   overrun). A periodic reconciliation sweep now recovers those misses, an overflow is
