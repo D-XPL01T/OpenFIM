@@ -179,11 +179,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Resolve the signing key before doing any work, so a misconfiguration fails
     // immediately rather than after the first undetectable event.
+    //
+    // A key file readable by other users is refused outright, the same way OpenSSH
+    // refuses an exposed private key: anything able to read it can forge the audit
+    // chain, so proceeding would teach the operator that the exposure is acceptable.
+    if let Some(ref key_path) = args.hmac_key_file {
+        openfim_common::require_owner_only_secret(key_path)?;
+    }
     let hmac_key = resolve_hmac_key(&args)?;
 
     // 2. Open SQLite baseline database
     let db = BaselineDb::open(&args.db)?;
     println!("[*] Local SQLite baseline active: {}", args.db.display());
+
+    // The baseline is not an ordinary application file: it holds the digests that
+    // define "unmodified", so anyone who can write it can redefine correct. Tighten it
+    // where possible and say so loudly where not.
+    match openfim_common::protect::restrict_to_owner(&args.db) {
+        Ok(true) => println!("[*] Tightened baseline database permissions to owner-only."),
+        Ok(false) => {}
+        Err(e) => eprintln!(
+            "[!] Could not restrict baseline database permissions: {}",
+            e
+        ),
+    }
+    if let Some(warning) = openfim_common::warn_if_exposed(&args.db, "baseline database") {
+        eprintln!("[!] {}", warning);
+    }
 
     if args.remediation {
         println!(
@@ -347,6 +369,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if registered_count == 0 && sweep_only_rules == 0 {
         eprintln!(
             "[!] Warning: 0 watch targets could be registered. Verify monitored paths exist on disk."
+        );
+    }
+
+    // Self-monitoring. The agent's own binary, policy, trusted public key and baseline
+    // are the first things an attacker goes after: replace the binary and monitoring
+    // stops; edit the policy and the monitored set shrinks; swap the public key and
+    // forged policies become trusted. These watches are registered unconditionally and
+    // cannot be removed by policy, because a policy able to disable self-monitoring
+    // would be the first thing an attacker edited.
+    let mut self_watched = 0;
+    for (label, candidate) in [
+        ("own binary", std::env::current_exe().ok()),
+        ("policy file", Some(args.config.clone())),
+        ("trusted public key", args.key.clone()),
+        ("baseline database", Some(args.db.clone())),
+    ] {
+        let Some(target) = candidate else { continue };
+        let dir = match target.parent() {
+            Some(d) if d.exists() => d.to_path_buf(),
+            _ => continue,
+        };
+        if watched_targets.insert(dir.clone())
+            && watcher.watch(&dir, RecursiveMode::NonRecursive).is_ok()
+        {
+            self_watched += 1;
+        }
+        let _ = label;
+    }
+    if self_watched > 0 {
+        println!(
+            "[*] Self-defense: watching {} additional location(s) holding the agent's own \
+             binary, policy, key and baseline.",
+            self_watched
         );
     }
 

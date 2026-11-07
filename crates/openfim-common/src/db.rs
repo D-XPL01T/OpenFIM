@@ -1012,6 +1012,27 @@ impl BaselineDb {
         Ok(total_removed)
     }
 
+    /// The chain head as it **actually exists on disk**: last sequence id, head HMAC,
+    /// and event count, all read from the event rows themselves.
+    ///
+    /// Deliberately ignores the `chain_meta` anchor. The anchor is a host-side record of
+    /// where the chain *should* be, which makes it useful for detecting truncation by
+    /// something that did not also update it — but it lives on the monitored host, so an
+    /// attacker can delete or rewrite it alongside the events.
+    ///
+    /// Signed checkpoints exist precisely to be compared against ground truth, so they
+    /// must read the rows. An earlier version of this consulted the anchor first, and
+    /// truncation then verified as consistent: the anchor still claimed the old count.
+    pub fn observed_chain_head(&self) -> Result<(i64, String, i64)> {
+        let count = self.count_spool_events()? as i64;
+        let seq: i64 = self.conn.query_row(
+            "SELECT COALESCE(MAX(sequence_id), 0) FROM event_spool",
+            [],
+            |r| r.get(0),
+        )?;
+        Ok((seq, self.get_last_spool_hmac()?, count))
+    }
+
     /// Total number of rows currently in the event spool.
     pub fn count_spool_events(&self) -> Result<usize> {
         let count: i64 = self

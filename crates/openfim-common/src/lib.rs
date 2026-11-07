@@ -1,6 +1,7 @@
 pub mod acl;
 pub mod backup;
 pub mod capabilities;
+pub mod checkpoint;
 pub mod crawler;
 pub mod db;
 pub mod detect;
@@ -11,6 +12,7 @@ pub mod hasher;
 pub mod lint;
 pub mod metadata;
 pub mod policy;
+pub mod protect;
 pub mod rate_limiter;
 pub mod sweep;
 pub mod whodata;
@@ -23,6 +25,7 @@ pub use backup::{
 pub use capabilities::{
     capability_matrix, platform_name, support_for, unsupported_checks, Capability, Check, Support,
 };
+pub use checkpoint::{Checkpoint, CheckpointVerdict};
 pub use crawler::{CrawlOptions, FileCrawler};
 pub use db::{
     compute_event_hmac_for, normalize_path_str, BaselineDb, BaselineDiff, ContentChange,
@@ -44,6 +47,9 @@ pub use policy::{
     path_looks_secret, ActiveResponseAction, ActiveResponseConfig, CompiledPolicy, Policy,
     PolicyGlobals, PolicyRule, PolicySigner, PolicyVerifier, RemediationGuard, RemediationOutcome,
     RuleChecks, RuleMode, DEFAULT_MAX_REMEDIATIONS_PER_HOUR,
+};
+pub use protect::{
+    exposure_of, require_owner_only_secret, warn_if_exposed, write_protected, Exposure,
 };
 pub use rate_limiter::TokenBucket;
 pub use sweep::{

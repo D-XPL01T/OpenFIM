@@ -178,6 +178,39 @@ if ($LASTEXITCODE -ne 0) {
     $failures += "Audit chain verification failed (exit $LASTEXITCODE)."
 }
 
+Write-Host "`n[STEP 11b] Signed Off-Host Checkpoint, And The Attack It Catches..." -ForegroundColor Green
+# The HMAC chain alone cannot survive host compromise: the agent must hold the chain key
+# to append events, so an attacker with host access holds it too and can rebuild a
+# clean-looking chain. Only a signature from the offline administrative key settles it.
+$ledger = "$demoDir\checkpoints.jsonl"
+& $cliExe audit checkpoint --db $dbFile --privkey "$demoDir\openfim_admin.key" --ledger $ledger --host "demo-host"
+
+Write-Host "[*] Chain verifies against the signed checkpoint:" -ForegroundColor Cyan
+& $cliExe audit verify --db $dbFile --checkpoint-ledger $ledger --pubkey "$demoDir\openfim_admin.pub" | Out-Null
+if ($LASTEXITCODE -ne 0) {
+    $failures += "A clean chain failed its own checkpoint cross-check."
+} else {
+    Write-Host "    [+] Consistent." -ForegroundColor Cyan
+}
+
+Write-Host "[*] Now simulating an attacker who wipes the log and rebuilds it:" -ForegroundColor Red
+$forgedDb = "$demoDir\forged.db"
+& $cliExe baseline snapshot --dir "$demoDir\data" --db $forgedDb 2>&1 | Out-Null
+
+& $cliExe audit verify --db $forgedDb 2>&1 | Out-Null
+$hmacOnly = $LASTEXITCODE
+& $cliExe audit verify --db $forgedDb --checkpoint-ledger $ledger --pubkey "$demoDir\openfim_admin.pub" 2>&1 | Out-Null
+$withCheckpoint = $LASTEXITCODE
+
+Write-Host "    HMAC chain alone:      exit $hmacOnly  (0 = accepted the forgery)" -ForegroundColor Yellow
+Write-Host "    With off-host ledger:  exit $withCheckpoint  (1 = caught it)" -ForegroundColor Green
+if ($hmacOnly -ne 0) {
+    $failures += "Expected the HMAC-only check to accept a rebuilt chain, demonstrating why checkpoints exist."
+}
+if ($withCheckpoint -eq 0) {
+    $failures += "The checkpoint cross-check FAILED to detect a wiped and rebuilt audit log."
+}
+
 # Note: tail-truncation and field-tampering detection are exercised by the integration
 # suite rather than here, because doing it from a shell script would require shipping a
 # "delete the evidence" command in the product itself. See

@@ -881,7 +881,9 @@ fn sub_generate_keys() -> Result<(), Box<dyn std::error::Error>> {
     let pub_path = key_dir.join("openfim_admin.pub");
     let priv_path = key_dir.join("openfim_admin.key");
     fs::write(&pub_path, &pub_hex)?;
-    fs::write(&priv_path, &priv_hex)?;
+    // Owner-only from creation: a signing key written with the ambient umask is
+    // world-readable on a default Linux setup.
+    openfim_common::write_protected(&priv_path, priv_hex.as_bytes())?;
 
     println!(
         "{}[+] Generated fresh Ed25519 administrative keys:{}",
@@ -1120,7 +1122,9 @@ fn op_setup_protection_wizard() -> Result<(), Box<dyn std::error::Error>> {
         let pub_path = key_dir.join("openfim_admin.pub");
         let priv_path = key_dir.join("openfim_admin.key");
         fs::write(&pub_path, &pub_hex)?;
-        fs::write(&priv_path, &priv_hex)?;
+        // Owner-only from creation: a signing key written with the ambient umask is
+        // world-readable on a default Linux setup.
+        openfim_common::write_protected(&priv_path, priv_hex.as_bytes())?;
 
         println!(
             "{}[+] Generated and saved fresh Ed25519 keys:{}",

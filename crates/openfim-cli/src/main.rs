@@ -221,6 +221,47 @@ pub enum AuditAction {
         /// Read the HMAC verification key from a file
         #[arg(long, conflicts_with = "key")]
         key_file: Option<PathBuf>,
+
+        /// Also cross-check the chain against a ledger of signed checkpoints.
+        ///
+        /// This is the only check that survives host compromise: the agent holds the
+        /// HMAC key, so an attacker with root can rebuild a clean-looking chain.
+        #[arg(long)]
+        checkpoint_ledger: Option<PathBuf>,
+
+        /// Ed25519 administrative public key used to verify checkpoints
+        #[arg(long)]
+        pubkey: Option<PathBuf>,
+    },
+
+    /// Take a signed checkpoint of the current audit chain head.
+    ///
+    /// Requires the administrative PRIVATE key, so this is an offline or
+    /// administrative operation. An agent able to mint its own checkpoints would give
+    /// an attacker on that host the same ability.
+    Checkpoint {
+        /// Path to the SQLite database holding the event spool
+        #[arg(short, long, default_value = "openfim.db")]
+        db: PathBuf,
+
+        /// Ed25519 administrative private key (file or hex)
+        #[arg(long)]
+        privkey: String,
+
+        /// Append-only ledger to write the checkpoint to
+        #[arg(short, long)]
+        ledger: PathBuf,
+
+        /// Host identifier recorded in the checkpoint
+        #[arg(long)]
+        host: Option<String>,
+    },
+
+    /// Report spool size, event counts and quota headroom
+    Stats {
+        /// Path to the SQLite database
+        #[arg(short, long, default_value = "openfim.db")]
+        db: PathBuf,
     },
 }
 
@@ -1275,7 +1316,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         Commands::Audit { action } => match action {
-            AuditAction::Verify { db, key, key_file } => {
+            AuditAction::Verify {
+                db,
+                key,
+                key_file,
+                checkpoint_ledger,
+                pubkey,
+            } => {
                 println!(
                     "[*] Auditing tamper-evident HMAC offline log: {}",
                     db.display()
@@ -1283,12 +1330,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let audit_key = resolve_audit_key(key.as_deref(), key_file.as_deref())?;
                 let baseline_db = BaselineDb::open(&db)?;
                 let report = baseline_db.verify_spool_chain(&audit_key)?;
+
+                let mut failed = !report.is_valid;
+
                 if report.is_valid {
                     println!("\n============================================================");
-                    println!("  [✓] AUDIT PASSED: Tamper-Evident HMAC Chain is VALID      ");
+                    println!("  [✓] HMAC CHAIN VALID                                      ");
                     println!("  Total Events Verified:  {}", report.total_events);
                     println!("  Sequence Continuity:    CONTIGUOUS (No gaps/deletions)    ");
-                    println!("  Cryptographic Status:   UNCOMPROMISED                     ");
                     println!("============================================================");
                 } else {
                     println!("\n============================================================");
@@ -1303,8 +1352,123 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                         report.error_message.unwrap_or_default()
                     );
                     println!("============================================================");
+                }
+
+                // The HMAC chain alone cannot survive host compromise: the agent must
+                // hold the key to append, so an attacker with root holds it too and can
+                // rebuild a clean-looking chain. Only a signature from the offline
+                // administrative key settles that.
+                match (checkpoint_ledger, pubkey) {
+                    (Some(ledger), Some(pk_path)) => {
+                        use openfim_common::checkpoint;
+
+                        let pk_str = std::fs::read_to_string(&pk_path)?;
+                        let verifying_key = openfim_common::PolicySigner::pubkey_from_hex(&pk_str)?;
+                        let checkpoints = checkpoint::read_ledger(&ledger)?;
+
+                        println!(
+                            "\n[*] Cross-checking against {} signed checkpoint(s) from {}",
+                            checkpoints.len(),
+                            ledger.display()
+                        );
+                        let verdict = checkpoint::verify_against_ledger(
+                            &baseline_db,
+                            &checkpoints,
+                            &verifying_key,
+                        )?;
+
+                        println!("============================================================");
+                        if verdict.is_consistent() {
+                            println!(
+                                "  [✓] CHECKPOINT CROSS-CHECK PASSED                          "
+                            );
+                        } else {
+                            println!(
+                                "  [✗] CHECKPOINT CROSS-CHECK FAILED                          "
+                            );
+                            failed = true;
+                        }
+                        println!("  {}", verdict.explain());
+                        println!("============================================================");
+                    }
+                    (None, _) => {
+                        println!(
+                            "\n[i] No checkpoint ledger given. The HMAC chain proves no event was \
+                             edited or deleted by anything lacking the chain key, but the agent \
+                             holds that key, so wholesale replacement of this log by an attacker \
+                             with host access cannot be ruled out. Pass --checkpoint-ledger and \
+                             --pubkey to close that gap."
+                        );
+                    }
+                    (Some(_), None) => {
+                        eprintln!(
+                            "[!] --checkpoint-ledger requires --pubkey (the administrative public \
+                             key that signed the checkpoints)."
+                        );
+                        std::process::exit(2);
+                    }
+                }
+
+                if failed {
                     std::process::exit(1);
                 }
+            }
+
+            AuditAction::Checkpoint {
+                db,
+                privkey,
+                ledger,
+                host,
+            } => {
+                use openfim_common::checkpoint;
+
+                let key_str = if std::path::Path::new(&privkey).exists() {
+                    std::fs::read_to_string(&privkey)?
+                } else {
+                    privkey
+                };
+                let signing_key = openfim_common::PolicySigner::privkey_from_hex(&key_str)?;
+
+                let baseline_db = BaselineDb::open(&db)?;
+                let cp = checkpoint::create(&baseline_db, &signing_key, host.as_deref())?;
+                checkpoint::append_to_ledger(&ledger, &cp)?;
+
+                println!("[+] Signed checkpoint appended to {}", ledger.display());
+                println!("      Events recorded:   {}", cp.event_count);
+                println!("      Head sequence:     {}", cp.last_sequence_id);
+                println!(
+                    "      Chain head:        {}...",
+                    &cp.last_hmac[..cp.last_hmac.len().min(16)]
+                );
+                if let Some(ref h) = cp.host {
+                    println!("      Host:              {}", h);
+                }
+                println!(
+                    "[i] Copy this ledger OFF this host. Its value is entirely in being \
+                     somewhere an attacker on this machine cannot reach."
+                );
+            }
+
+            AuditAction::Stats { db } => {
+                let baseline_db = BaselineDb::open(&db)?;
+                let (seq, head, count) = baseline_db.observed_chain_head()?;
+                let size = baseline_db.spool_size_bytes()?;
+                let unsent = baseline_db.get_unsent_spool_events(usize::MAX)?.len();
+
+                println!("======================================================================");
+                println!("                      OPENFIM AUDIT SPOOL STATS                       ");
+                println!("======================================================================");
+                println!("Database:            {}", db.display());
+                println!("Baseline entries:    {}", baseline_db.count_entries()?);
+                println!("Spool events:        {}", count);
+                println!("Head sequence id:    {}", seq);
+                println!("Chain head:          {}...", &head[..head.len().min(16)]);
+                println!("Unsent backlog:      {}", unsent);
+                println!(
+                    "On-disk size:        {:.2} MB",
+                    size as f64 / (1024.0 * 1024.0)
+                );
+                println!("======================================================================");
             }
         },
     }

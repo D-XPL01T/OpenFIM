@@ -24,6 +24,8 @@ This repository contains the complete, production-grade defensive reference arch
 | **16** | [`16_ROADMAP.md`](file:///d:/VibeCode/file_integrity/docs/16_ROADMAP.md) | MVP (6 weeks), v1.0, v2.0 roadmap milestones, risk register, open technical questions. |
 | **17** | [`17_ARCHITECTURE_DECISION_RECORDS.md`](file:///d:/VibeCode/file_integrity/docs/17_ARCHITECTURE_DECISION_RECORDS.md) | ADR-001 through ADR-007 covering all fundamental architectural trade-offs. |
 | **18** | [`18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md`](file:///d:/VibeCode/file_integrity/docs/18_HARDENING_AND_PRODUCTIONIZATION_PLAN.md) | Phased plan to enforce the full policy contract, harden operations, and reach portfolio grade. |
+| **19** | [`19_SESSION_CONTINUATION.md`](file:///d:/VibeCode/file_integrity/docs/19_SESSION_CONTINUATION.md) | Handoff document: resume this work from zero context, with environment notes, state, next steps and open caveats. |
+| **Sec** | [`SECURITY.md`](file:///d:/VibeCode/file_integrity/SECURITY.md) | Disclosure policy, threat model, what the audit chain does and does not prove, secret handling. |
 | **Plan** | [`BUILD_ORDER_CHECKLIST.md`](file:///d:/VibeCode/file_integrity/docs/BUILD_ORDER_CHECKLIST.md) | Concrete implementation checklist for the initial build (Weeks 1 and 2). |
 
 ## Standalone Artifacts
