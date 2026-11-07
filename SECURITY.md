@@ -143,6 +143,30 @@ matter.
   preference to a command-line argument, which is visible to every local user through
   the process table. There is deliberately **no default key**: a built-in one would make
   every deployment's audit chain forgeable by anyone holding the binary.
+- **The chain key is derived, not shared.** The operator's secret is a *root* key. The
+  key that actually signs a given database is `HKDF-SHA256(root, per-database random
+  salt, domain)`. Operators deploying a fleet naturally reuse one secret, which
+  previously meant **one compromised host yielded the key to every host's audit log**.
+  Derivation contains that: HKDF is one-way, so a leaked derived key exposes neither the
+  root nor any other host's key. The salt is stored beside the chain it protects, which
+  is fine — a salt is not a secret.
+  - This does **not** help against an attacker holding both the root key and the
+    database. Nothing can, since the agent needs the derived key to append. It bounds
+    the realistic case: a stolen database, a leaked backup, a shared log directory.
+  - A database written before derivation existed stays on the raw key, recorded
+    explicitly, so its existing chain keeps verifying. Switching it silently would
+    report tampering across an intact chain.
+- **On Windows the root key file can be DPAPI-wrapped** (`CryptProtectData`, machine
+  scope), so copying it to another host renders it useless. On Linux the equivalent
+  would be the kernel keyring or Secret Service; neither is implemented, so there the
+  protection is file permissions plus derivation — and the tool says so rather than
+  implying more.
+- **The spool can be made append-only on Linux** with `--append-only-spool`
+  (`FS_APPEND_FL`). The kernel then refuses to truncate or rewrite it, and clearing the
+  flag needs `CAP_LINUX_IMMUTABLE`, which most compromised service accounts do not hold.
+  It is defence in depth, not absolute: root with full capabilities clears the flag. The
+  outcome is always reported, never assumed, because an operator who believes the spool
+  is immutable when the call failed is worse off than one who knows it is not.
 - **A backup store holds verbatim copies** of monitored files, including secrets if you
   back them up. Protect it to the same standard as the files it mirrors. `policy lint`
   notes this when a `nodiff` path also has `restore_baseline` configured.

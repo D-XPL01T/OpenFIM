@@ -1516,7 +1516,7 @@ fn run_inprocess_sensor(
     // No built-in key: a shared constant would let anyone with the binary forge the
     // audit chain, and would also silently disagree with the key the agent daemon
     // signs with, so chains written here would fail `audit verify` there.
-    let hmac_key = match resolve_console_audit_key()? {
+    let root_key = match resolve_console_audit_key()? {
         Some(k) => k,
         None => {
             println!(
@@ -1527,6 +1527,16 @@ fn run_inprocess_sensor(
             return Ok(());
         }
     };
+
+    // Derive this database's chain key exactly as the agent does, so events written
+    // here verify there and vice versa.
+    let (hmac_key, key_scheme) = db.resolve_chain_key(&root_key)?;
+    println!(
+        "{}[*] Chain key scheme: {}{}",
+        DIM,
+        key_scheme.describe(),
+        RESET
+    );
 
     // Open the pristine-copy store once, before the loop, and report a bad path up
     // front rather than mid-incident.
@@ -1802,7 +1812,16 @@ fn op_forensics_and_audit() -> Result<(), Box<dyn std::error::Error>> {
         "{}[*] Cryptographically auditing HMAC chain and sequence continuity...{}",
         CYAN, RESET
     );
-    let report = db.verify_spool_chain(&key_str)?;
+    // Derive exactly as the agent does, or a derived chain would be reported as
+    // tampered when it is intact.
+    let (chain_key, scheme) = db.resolve_chain_key(&key_str)?;
+    println!(
+        "{}[*] Chain key scheme: {}{}",
+        DIM,
+        scheme.describe(),
+        RESET
+    );
+    let report = db.verify_spool_chain(&chain_key)?;
 
     if report.is_valid {
         println!(

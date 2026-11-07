@@ -5,7 +5,7 @@ to pick up where the last session paused is here.
 
 **Last updated:** 2026-11-07
 **Branch:** `master`, tracking `origin/main` on `https://github.com/D-XPL01T/OpenFIM`
-**Verified state at handoff:** 244 tests passing, `cargo clippy --all-targets` clean,
+**Verified state at handoff:** 267 tests passing, `cargo clippy --all-targets` clean,
 `cargo fmt --check` clean, end-to-end demo passing (exit 0).
 
 ---
@@ -89,18 +89,17 @@ Key modules introduced:
 
 ### Phase 2 — operational hardening: **partial**
 
-Done: 2.1–2.5, 2.7–2.9, 2.12–2.15.
+Done: 2.1–2.15 (everything except service install and logging).
 
 | Module | Purpose |
 |---|---|
 | `backup.rs` | Content-addressed pristine-copy store (fixed a data-loss bug). |
 | `checkpoint.rs` | Ed25519 signed off-host chain checkpoints. |
-| `protect.rs` | Owner-only permissions on state and key material. |
+| `protect.rs` | Owner-only permissions on state and key material; opt-in Linux append-only spool. |
+| `keymgmt.rs` | HKDF-SHA256 per-database chain key derivation; DPAPI key-at-rest wrapping on Windows. |
 
 **Outstanding in Phase 2:**
-- **2.6** append-only spool on Linux (`chattr +a`, needs `CAP_LINUX_IMMUTABLE`)
-- **2.10** HKDF-SHA256 derivation of the chain key from a root key, per-database salt
-- **2.11** OS keystore integration (DPAPI on Windows, Secret Service / kernel keyring on Linux)
+- **2.11 (partial)** the Linux kernel keyring / Secret Service backend; DPAPI on Windows is done
 - **2.16** systemd unit with hardening directives
 - **2.17** Windows Service support (`windows-service` crate)
 - **2.18** structured logging via `tracing`, replacing `println!`, with `--log-format json`
@@ -119,22 +118,23 @@ asciinema demo, CONTRIBUTING/CHANGELOG, ADRs 008–010, JSON Schema for the poli
 
 The highest-value remaining work, in order:
 
-1. **2.10 + 2.11 — key management.** The chain key is currently a raw string from
-   `OPENFIM_HMAC_KEY` or a file. HKDF derivation with a per-database salt means one
-   leaked key does not compromise every host; OS keystore integration gets it out of
-   plaintext. This is the last significant gap in the "audit chain survives compromise"
-   story, now that checkpoints exist.
-2. **2.18 — structured logging.** Everything currently goes through `println!`. A
+1. **2.18 — structured logging.** Everything currently goes through `println!`. A
    security tool whose output cannot be ingested by a SIEM is hard to operate, and this
-   blocks any later forwarding work.
-3. **2.16 + 2.17 — service install.** Needed before the tool is usable unattended: the
-   daemon is currently a foreground process that dies with its terminal.
-4. **3.6 — fuzz targets** for the four parsers that take untrusted input (policy YAML,
+   blocks any later forwarding work. Expect ~100 call sites across three crates; a
+   surgical option is to route the *event* stream through `tracing` while leaving the
+   interactive console output human-readable.
+2. **2.16 + 2.17 — service install.** Needed before the tool is usable unattended: the
+   daemon is currently a foreground process that dies with its terminal. systemd unit
+   with hardening directives (`ProtectSystem=strict`, `NoNewPrivileges`,
+   `CapabilityBoundingSet`), and the `windows-service` crate for the Windows side.
+3. **3.6 — fuzz targets** for the four parsers that take untrusted input (policy YAML,
    `.sha256` and JSON manifests, `normalize_path_str`, `verify_spool_chain`). A FIM that
    panics on a malformed manifest is a denial of service against the monitor.
-5. **3.10 — STRIDE traceability matrix** mapping every threat in doc 02 to the test that
+4. **3.10 — STRIDE traceability matrix** mapping every threat in doc 02 to the test that
    exercises it. This is the artifact that most distinguishes a security project from a
    project that mentions security.
+5. **2.11 remainder** — the Linux kernel keyring or Secret Service backend, so the root
+   key is not a plaintext file there. DPAPI already covers Windows.
 
 ### Explicitly deferred (do not start without discussion)
 Kernel process attribution (fanotify `FAN_REPORT_PIDFD` / eBPF / Windows minifilter),

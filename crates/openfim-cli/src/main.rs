@@ -1327,8 +1327,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "[*] Auditing tamper-evident HMAC offline log: {}",
                     db.display()
                 );
-                let audit_key = resolve_audit_key(key.as_deref(), key_file.as_deref())?;
+                let root_key = resolve_audit_key(key.as_deref(), key_file.as_deref())?;
                 let baseline_db = BaselineDb::open(&db)?;
+                // Derive exactly as the agent does, or a derived chain would be
+                // reported as tampered when it is intact.
+                let (audit_key, scheme) = baseline_db.resolve_chain_key(&root_key)?;
+                println!("[*] Chain key scheme: {}", scheme.describe());
                 let report = baseline_db.verify_spool_chain(&audit_key)?;
 
                 let mut failed = !report.is_valid;

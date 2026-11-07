@@ -74,6 +74,14 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_MAX_REMEDIATIONS_PER_HOUR)]
     max_remediations_per_hour: u32,
 
+    /// Request the Linux append-only inode flag on the spool database.
+    ///
+    /// Raises the bar on evidence destruction: the kernel then refuses to truncate or
+    /// rewrite the file, and clearing the flag needs CAP_LINUX_IMMUTABLE. Opt-in, and
+    /// the result is always reported rather than assumed.
+    #[arg(long)]
+    append_only_spool: bool,
+
     /// Seconds between liveness heartbeats and spool-quota enforcement.
     ///
     /// Heartbeats make a coverage gap visible: without them, an agent stopped by an
@@ -186,10 +194,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(ref key_path) = args.hmac_key_file {
         openfim_common::require_owner_only_secret(key_path)?;
     }
-    let hmac_key = resolve_hmac_key(&args)?;
+    let root_key = resolve_hmac_key(&args)?;
 
     // 2. Open SQLite baseline database
     let db = BaselineDb::open(&args.db)?;
+
+    // Derive this database's chain key from the operator's root secret, so a fleet
+    // sharing one secret does not share one chain key. A database that already holds
+    // events but no recorded scheme predates derivation and stays on the raw key, since
+    // switching it would make its entire existing chain fail verification and the tool
+    // would report tampering where there was none.
+    let (hmac_key, key_scheme) = db.resolve_chain_key(&root_key)?;
+    println!("[*] Chain key:         {}", key_scheme.describe());
+    if key_scheme == openfim_common::KeyScheme::Raw {
+        println!(
+            "[!] This database predates key derivation. Its chain is still valid, but the \
+             supplied secret signs it directly, so a leak compromises every host sharing \
+             that secret. Re-baseline into a fresh database to adopt derivation."
+        );
+    }
     println!("[*] Local SQLite baseline active: {}", args.db.display());
 
     // The baseline is not an ordinary application file: it holds the digests that
@@ -205,6 +228,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     if let Some(warning) = openfim_common::warn_if_exposed(&args.db, "baseline database") {
         eprintln!("[!] {}", warning);
+    }
+
+    if args.append_only_spool {
+        let outcome = openfim_common::protect::request_append_only(&args.db);
+        if outcome.is_protected() {
+            println!("[*] Spool append-only: {}", outcome.explain());
+        } else {
+            // Never claim a protection that was not applied.
+            eprintln!("[!] Spool append-only NOT in force: {}", outcome.explain());
+        }
     }
 
     if args.remediation {
@@ -1402,6 +1435,7 @@ mod tests {
             remediation: false,
             max_remediations_per_hour: 3,
             heartbeat_secs: 300,
+            append_only_spool: false,
             backup_dir: None,
         }
     }

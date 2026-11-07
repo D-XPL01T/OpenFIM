@@ -206,10 +206,167 @@ pub fn warn_if_exposed(path: &Path, what: &str) -> Option<String> {
     }
 }
 
+/// Outcome of attempting to make a file append-only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AppendOnlyOutcome {
+    /// The immutable/append-only flag is now set.
+    Applied,
+    /// Already set; nothing to do.
+    AlreadySet,
+    /// Not attempted, because this platform has no equivalent.
+    Unsupported(&'static str),
+    /// Attempted and refused. The reason is almost always missing privilege.
+    Refused(String),
+}
+
+impl AppendOnlyOutcome {
+    pub fn is_protected(&self) -> bool {
+        matches!(
+            self,
+            AppendOnlyOutcome::Applied | AppendOnlyOutcome::AlreadySet
+        )
+    }
+
+    pub fn explain(&self) -> String {
+        match self {
+            AppendOnlyOutcome::Applied => {
+                "append-only flag set: the kernel will now refuse to truncate or rewrite \
+                 this file, even for root, until the flag is cleared"
+                    .to_string()
+            }
+            AppendOnlyOutcome::AlreadySet => "already append-only".to_string(),
+            AppendOnlyOutcome::Unsupported(why) => format!("not available: {}", why),
+            AppendOnlyOutcome::Refused(why) => format!("refused: {}", why),
+        }
+    }
+}
+
+/// Requests the Linux append-only inode flag (`chattr +a`) on a path.
+///
+/// # What this buys, and what it costs
+///
+/// With `FS_APPEND_FL` set, the kernel refuses to truncate or rewrite the file. That
+/// raises the bar on evidence destruction meaningfully: an attacker who gains root still
+/// cannot simply overwrite the spool, because clearing the flag needs
+/// `CAP_LINUX_IMMUTABLE`, which is separately droppable and is not held by most
+/// compromised service accounts.
+///
+/// It is not absolute. Root with full capabilities clears the flag and proceeds, and the
+/// flag is ext2/3/4-and-friends specific. It is defence in depth, which is why the
+/// outcome is reported rather than assumed: an operator who believes the spool is
+/// immutable when the call silently failed is worse off than one who knows it is not.
+///
+/// SQLite in WAL mode writes to `-wal` and `-shm` sidecars rather than rewriting the
+/// main database, so the main file tolerates this better than a rollback-journal
+/// database would. Even so, this is opt-in.
+pub fn request_append_only(path: &Path) -> AppendOnlyOutcome {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+
+        // FS_IOC_GETFLAGS / FS_IOC_SETFLAGS and the append-only bit. Declared here
+        // rather than pulled from libc, which does not expose them on all targets.
+        const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+        const FS_IOC_SETFLAGS: libc::c_ulong = 0x4008_6602;
+        const FS_APPEND_FL: libc::c_long = 0x0000_0020;
+
+        let file = match std::fs::OpenOptions::new().read(true).open(path) {
+            Ok(f) => f,
+            Err(e) => return AppendOnlyOutcome::Refused(format!("cannot open: {}", e)),
+        };
+
+        let mut flags: libc::c_long = 0;
+        // SAFETY: the fd is valid and owned by `file`; `flags` is a correctly typed
+        // out-parameter for this ioctl.
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_GETFLAGS, &mut flags) };
+        if rc != 0 {
+            return AppendOnlyOutcome::Refused(format!(
+                "FS_IOC_GETFLAGS failed ({}); the filesystem may not support inode flags",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        if flags & FS_APPEND_FL != 0 {
+            return AppendOnlyOutcome::AlreadySet;
+        }
+
+        let new_flags = flags | FS_APPEND_FL;
+        // SAFETY: as above.
+        let rc = unsafe { libc::ioctl(file.as_raw_fd(), FS_IOC_SETFLAGS, &new_flags) };
+        if rc != 0 {
+            return AppendOnlyOutcome::Refused(format!(
+                "FS_IOC_SETFLAGS failed ({}); setting the append-only flag needs \
+                 CAP_LINUX_IMMUTABLE",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        AppendOnlyOutcome::Applied
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        AppendOnlyOutcome::Unsupported(
+            "the append-only inode flag is a Linux feature; on Windows the nearest \
+             equivalent is a deny-delete ACE, which is not yet implemented",
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn append_only_reports_an_outcome_rather_than_assuming_success() {
+        // The point of returning an outcome: an operator who believes the spool is
+        // immutable when the call silently failed is worse off than one who knows it is
+        // not. Every path must produce an explanation.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("spool.db");
+        std::fs::write(&path, b"x").unwrap();
+
+        let outcome = request_append_only(&path);
+        assert!(
+            !outcome.explain().is_empty(),
+            "the outcome must always explain itself"
+        );
+
+        if cfg!(target_os = "linux") {
+            // On Linux this either works or is refused for want of CAP_LINUX_IMMUTABLE,
+            // or the filesystem lacks inode flags. All are acceptable; silence is not.
+            assert!(
+                matches!(
+                    outcome,
+                    AppendOnlyOutcome::Applied
+                        | AppendOnlyOutcome::AlreadySet
+                        | AppendOnlyOutcome::Refused(_)
+                ),
+                "unexpected outcome on Linux: {:?}",
+                outcome
+            );
+        } else {
+            assert!(
+                matches!(outcome, AppendOnlyOutcome::Unsupported(_)),
+                "non-Linux platforms must report the feature as unavailable, not claim \
+                 a protection they do not provide: {:?}",
+                outcome
+            );
+            assert!(!outcome.is_protected());
+        }
+    }
+
+    #[test]
+    fn append_only_on_a_missing_path_is_refused_not_claimed() {
+        let outcome = request_append_only(Path::new("openfim-no-such-path-append-only"));
+        assert!(
+            !outcome.is_protected(),
+            "a missing path must never report as protected: {:?}",
+            outcome
+        );
+    }
 
     #[test]
     fn write_protected_creates_a_readable_file() {

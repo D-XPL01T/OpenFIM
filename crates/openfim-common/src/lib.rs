@@ -9,6 +9,7 @@ pub mod diff;
 pub mod error;
 pub mod fsident;
 pub mod hasher;
+pub mod keymgmt;
 pub mod lint;
 pub mod metadata;
 pub mod policy;
@@ -38,6 +39,7 @@ pub use error::{OpenFimError, Result};
 pub use fsident::FsIdentity;
 pub use hasher::{FileIdentity, HashAlgorithm, HashResult, StreamHasher, DEFAULT_BUFFER_SIZE};
 pub use hex;
+pub use keymgmt::{derive_chain_key, generate_salt, KeyScheme};
 pub use lint::{lint_policy, Finding, LintReport, Severity as LintSeverity};
 pub use metadata::{
     ownership_checks_supported, posix_mode_supported, FileMetadata, DIRECTORY_SENTINEL_DIGEST,

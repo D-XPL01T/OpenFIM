@@ -5,7 +5,8 @@ use sha2::Sha256;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{OpenFimError, Result};
+use crate::keymgmt::{self, KeyScheme};
 use crate::metadata::FileMetadata;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -391,6 +392,19 @@ impl BaselineDb {
                 last_hmac TEXT NOT NULL,
                 event_count INTEGER NOT NULL
             );
+
+            -- How this database's chain key relates to the operator's root secret.
+            --
+            -- Recorded per database so that a fleet sharing one root key does not share
+            -- one chain key: the salt here feeds HKDF, and a leaked derived key reveals
+            -- neither the root nor any other host's key. A salt is not a secret, so
+            -- storing it beside the chain it protects is fine.
+            CREATE TABLE IF NOT EXISTS key_meta (
+                id INTEGER PRIMARY KEY CHECK (id = 1),
+                scheme TEXT NOT NULL,
+                salt TEXT,
+                created_at INTEGER NOT NULL
+            );
             "#,
         )?;
 
@@ -428,6 +442,80 @@ impl BaselineDb {
             names.push(r?);
         }
         Ok(names)
+    }
+
+    /// Resolves the chain key for this database from the operator's root secret,
+    /// establishing the derivation scheme on first use.
+    ///
+    /// Backward compatibility is deliberate and load-bearing: a database that already
+    /// holds events but has no `key_meta` row predates derivation, so it is pinned to
+    /// the legacy raw scheme. Silently switching it to HKDF would change the key and
+    /// make its entire existing audit chain fail verification — the tool would report
+    /// tampering where there was none, which for a security product is the worst
+    /// possible false positive.
+    ///
+    /// A fresh or empty database adopts HKDF with a new random salt.
+    pub fn resolve_chain_key(&self, root_key: &[u8]) -> Result<(Vec<u8>, KeyScheme)> {
+        if let Some((scheme, salt)) = self.read_key_meta()? {
+            let key = keymgmt::chain_key_for(scheme, root_key, salt.as_deref())?;
+            return Ok((key, scheme));
+        }
+
+        // No recorded scheme. Decide by whether there is already a chain to preserve.
+        let has_history = self.count_spool_events()? > 0;
+        if has_history {
+            self.write_key_meta(KeyScheme::Raw, None)?;
+            return Ok((root_key.to_vec(), KeyScheme::Raw));
+        }
+
+        let salt = keymgmt::generate_salt();
+        self.write_key_meta(KeyScheme::HkdfSha256, Some(&salt))?;
+        let key = keymgmt::derive_chain_key(root_key, &salt)?;
+        Ok((key.to_vec(), KeyScheme::HkdfSha256))
+    }
+
+    /// The recorded key scheme and salt, if established.
+    pub fn read_key_meta(&self) -> Result<Option<(KeyScheme, Option<Vec<u8>>)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT scheme, salt FROM key_meta WHERE id = 1")?;
+        let mut rows = stmt.query([])?;
+        if let Some(row) = rows.next()? {
+            let scheme_id: String = row.get(0)?;
+            let salt_hex: Option<String> = row.get(1)?;
+            let scheme = KeyScheme::from_id(&scheme_id).ok_or_else(|| {
+                OpenFimError::Other(format!(
+                    "database records an unknown key scheme {:?}; it was written by a \
+                     newer build of OpenFIM",
+                    scheme_id
+                ))
+            })?;
+            let salt = match salt_hex {
+                Some(h) => Some(hex::decode(h)?),
+                None => None,
+            };
+            Ok(Some((scheme, salt)))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn write_key_meta(&self, scheme: KeyScheme, salt: Option<&[u8]>) -> Result<()> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        self.conn.execute(
+            r#"
+            INSERT INTO key_meta (id, scheme, salt, created_at) VALUES (1, ?1, ?2, ?3)
+            ON CONFLICT(id) DO UPDATE SET
+                scheme = excluded.scheme,
+                salt = excluded.salt,
+                created_at = excluded.created_at
+            "#,
+            params![scheme.id(), salt.map(hex::encode), now],
+        )?;
+        Ok(())
     }
 
     /// Reads the persisted chain anchor, if one exists.
@@ -1805,6 +1893,135 @@ mod tests {
             .diff_filesystem_scoped(&[], Some(Path::new("/etc")))
             .unwrap();
         assert_eq!(diff.removed.len(), 1);
+    }
+
+    // ---------------- Chain key derivation ----------------
+
+    #[test]
+    fn test_fresh_database_adopts_derivation() {
+        let db = BaselineDb::open_in_memory().unwrap();
+        let (key, scheme) = db.resolve_chain_key(b"root-secret").unwrap();
+
+        assert_eq!(scheme, KeyScheme::HkdfSha256);
+        assert_eq!(key.len(), keymgmt::CHAIN_KEY_LEN);
+        assert_ne!(
+            key, b"root-secret",
+            "the root secret must not be used directly on a fresh database"
+        );
+    }
+
+    #[test]
+    fn test_derivation_is_stable_across_reopens() {
+        // The scheme and salt are persisted, so the same root key must keep yielding
+        // the same chain key; otherwise every restart would invalidate the chain.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fim.db");
+
+        let first = {
+            let db = BaselineDb::open(&path).unwrap();
+            db.resolve_chain_key(b"root-secret").unwrap().0
+        };
+        let second = {
+            let db = BaselineDb::open(&path).unwrap();
+            db.resolve_chain_key(b"root-secret").unwrap().0
+        };
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn test_two_databases_derive_different_keys_from_one_root() {
+        // The blast-radius property: a fleet sharing a root secret must not share a
+        // chain key, so compromising one host does not let an attacker forge another's
+        // audit log.
+        let a = BaselineDb::open_in_memory().unwrap();
+        let b = BaselineDb::open_in_memory().unwrap();
+
+        let (key_a, _) = a.resolve_chain_key(b"fleet-root").unwrap();
+        let (key_b, _) = b.resolve_chain_key(b"fleet-root").unwrap();
+
+        assert_ne!(
+            key_a, key_b,
+            "two databases derived the same chain key from one root secret"
+        );
+    }
+
+    #[test]
+    fn test_existing_chain_is_pinned_to_the_legacy_raw_key() {
+        // The dangerous case. A database written before derivation existed must keep
+        // verifying: silently switching it to HKDF would change the key and report
+        // tampering across an intact chain, which is the worst possible false positive
+        // for a security tool.
+        let db = BaselineDb::open_in_memory().unwrap();
+
+        // Simulate a legacy database: events exist, no key_meta row.
+        let mut ev = spool_event("legacy-1", "/etc/passwd");
+        db.append_spool_event_chained(&mut ev, b"legacy-secret")
+            .unwrap();
+        db.connection().execute("DELETE FROM key_meta", []).unwrap();
+
+        let (key, scheme) = db.resolve_chain_key(b"legacy-secret").unwrap();
+        assert_eq!(scheme, KeyScheme::Raw);
+        assert_eq!(key, b"legacy-secret");
+
+        // And the pre-existing chain still verifies under that key.
+        assert!(
+            db.verify_spool_chain(&key).unwrap().is_valid,
+            "a legacy chain stopped verifying after the derivation upgrade"
+        );
+    }
+
+    #[test]
+    fn test_legacy_decision_is_recorded_so_it_does_not_flip() {
+        let db = BaselineDb::open_in_memory().unwrap();
+        let mut ev = spool_event("legacy-1", "/etc/passwd");
+        db.append_spool_event_chained(&mut ev, b"legacy-secret")
+            .unwrap();
+        db.connection().execute("DELETE FROM key_meta", []).unwrap();
+
+        let (_, first) = db.resolve_chain_key(b"legacy-secret").unwrap();
+        let (_, second) = db.resolve_chain_key(b"legacy-secret").unwrap();
+        assert_eq!(first, KeyScheme::Raw);
+        assert_eq!(
+            second,
+            KeyScheme::Raw,
+            "the legacy decision must be persisted, not re-derived from row counts \
+             that change as events arrive"
+        );
+    }
+
+    #[test]
+    fn test_unknown_key_scheme_is_an_error_not_a_guess() {
+        let db = BaselineDb::open_in_memory().unwrap();
+        db.connection()
+            .execute(
+                "INSERT INTO key_meta (id, scheme, salt, created_at) VALUES (1, 'from-the-future', NULL, 0)",
+                [],
+            )
+            .unwrap();
+
+        let err = db
+            .resolve_chain_key(b"root")
+            .expect_err("an unknown scheme must not be guessed at");
+        assert!(err.to_string().contains("unknown key scheme"));
+    }
+
+    #[test]
+    fn test_derived_chain_round_trips_through_verification() {
+        let db = BaselineDb::open_in_memory().unwrap();
+        let (key, scheme) = db.resolve_chain_key(b"root-secret").unwrap();
+        assert_eq!(scheme, KeyScheme::HkdfSha256);
+
+        for i in 0..4 {
+            let mut ev = spool_event(&format!("evt-{}", i), &format!("/etc/f{}", i));
+            db.append_spool_event_chained(&mut ev, &key).unwrap();
+        }
+
+        assert!(db.verify_spool_chain(&key).unwrap().is_valid);
+        // And the raw root secret must NOT verify it.
+        assert!(
+            !db.verify_spool_chain(b"root-secret").unwrap().is_valid,
+            "the undervied root secret verified a derived chain"
+        );
     }
 
     // ---------------- Spool quota ----------------

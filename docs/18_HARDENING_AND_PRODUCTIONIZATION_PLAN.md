@@ -10,11 +10,11 @@
 |---|---|---|
 | **Phase 0** — documentation truth | **done** | Capability matrix and limitations published; checklist claims corrected. |
 | **Phase 1** — policy contract | **done** | 1.1–1.5 (`detect.rs`, all call sites routed), 1.6–1.8 (xattr, ACL and owner-SID capture), 1.9 (attributes split from permissions), 1.10–1.13 (globals honoured, spool quota), 1.14–1.17 (rule modes, reconciliation sweep, overflow detection, heartbeats), 1.18–1.20 (bounded diff capture with fail-safe `nodiff`), 1.21–1.23 (schema closed, `policy lint`, capability matrix as code). |
-| **Phase 2** — operational hardening | **partial** | Done: 2.1–2.4 (content-addressed backup store, `baseline backup`, digest-verified restore, legacy layout refused), 2.5 + 2.12 (owner-only state and key material, exposed keys refused), 2.7 (self-monitoring of own binary, policy, key and baseline), 2.8–2.9 (Ed25519 signed off-host checkpoints and `audit verify --checkpoint-ledger`), 2.13 (SECURITY.md threat model), 2.14–2.15 (spool quota, `audit stats`). Outstanding: 2.6 (append-only spool), 2.10–2.11 (HKDF derivation, OS keystore), 2.16–2.19 (service install, structured logging). |
+| **Phase 2** — operational hardening | **partial** | Done: 2.1–2.4 (content-addressed backup store, `baseline backup`, digest-verified restore, legacy layout refused), 2.5 + 2.12 (owner-only state and key material, exposed keys refused), 2.7 (self-monitoring of own binary, policy, key and baseline), 2.8–2.9 (Ed25519 signed off-host checkpoints and `audit verify --checkpoint-ledger`), 2.13 (SECURITY.md threat model), 2.14–2.15 (spool quota, `audit stats`). Outstanding: 2.16–2.19 (service install, structured logging, restart reconciliation). Also done: 2.6 (opt-in Linux append-only spool), 2.10 (HKDF-SHA256 per-database chain key derivation), 2.11 (DPAPI key-at-rest wrapping on Windows; the Linux keyring remains unimplemented and is reported as such). |
 | **Phase 3** — portfolio grade | **partial** | Done: 3.1 (three-platform CI). Outstanding: 3.2–3.17. |
 
 **All 19 policy fields** are now either enforced or explicitly refused with a stated
-reason, up from 6 at the baseline commit. The test suite has grown from 97 to 227.
+reason, up from 6 at the baseline commit. The test suite has grown from 97 to 267.
 
 The two refusals are `checks.attributes` on Unix (the `chattr` inode flag set is not
 captured, and aliasing it to the POSIX mode would silently duplicate
