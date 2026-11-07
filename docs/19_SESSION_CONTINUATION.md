@@ -5,7 +5,7 @@ to pick up where the last session paused is here.
 
 **Last updated:** 2026-11-07
 **Branch:** `master`, tracking `origin/main` on `https://github.com/D-XPL01T/OpenFIM`
-**Verified state at handoff:** 267 tests passing, `cargo clippy --all-targets` clean,
+**Verified state at handoff:** 272 tests passing, `cargo clippy --all-targets` clean,
 `cargo fmt --check` clean, end-to-end demo passing (exit 0).
 
 ---
@@ -100,10 +100,7 @@ Done: 2.1–2.15 (everything except service install and logging).
 
 **Outstanding in Phase 2:**
 - **2.11 (partial)** the Linux kernel keyring / Secret Service backend; DPAPI on Windows is done
-- **2.16** systemd unit with hardening directives
-- **2.17** Windows Service support (`windows-service` crate)
-- **2.18** structured logging via `tracing`, replacing `println!`, with `--log-format json`
-- **2.19** graceful restart reconciliation (partly covered by the existing boot sweep)
+- **2.17** Windows Service support (`windows-service` crate). Deliberately not attempted here: it cannot be verified without a machine where a service can be installed and restarted, and shipping it untested would be worse than its absence.
 
 ### Phase 3 — portfolio grade: **partial**
 Only **3.1** (CI) is done. Outstanding: 3.2 security workflow (`cargo-audit`,

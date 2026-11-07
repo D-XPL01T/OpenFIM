@@ -1,0 +1,136 @@
+[Unit]
+# OpenFIM file integrity sensor.
+#
+# Install:
+#   sudo install -m 0755 target/release/openfim-agent /usr/local/bin/
+#   sudo install -d -m 0750 /etc/openfim /var/lib/openfim
+#   sudo install -m 0600 policy.yaml /etc/openfim/
+#   sudo install -m 0644 openfim_admin.pub /etc/openfim/
+#   sudo install -m 0600 chain.key /etc/openfim/        # see OPENFIM_HMAC_KEY below
+#   sudo install -m 0644 packaging/systemd/openfim-agent.service /etc/systemd/system/
+#   sudo systemctl daemon-reload && sudo systemctl enable --now openfim-agent
+Description=OpenFIM file integrity sensor
+Documentation=https://github.com/D-XPL01T/OpenFIM
+After=network.target local-fs.target
+# The monitored filesystems must be mounted before baselining is meaningful.
+Requires=local-fs.target
+
+[Service]
+Type=simple
+
+# ---------------------------------------------------------------------------
+# Identity
+# ---------------------------------------------------------------------------
+#
+# Runs as root by default, because a file integrity monitor must read files that
+# deliberately exclude every other account: /etc/shadow, private keys, root-owned
+# binaries. A dedicated unprivileged user is viable only if the monitored set happens
+# to be readable by it, and silently missing unreadable files would be worse than
+# running privileged — so the capability set below is narrowed instead.
+User=root
+Group=root
+
+# ---------------------------------------------------------------------------
+# Secrets
+# ---------------------------------------------------------------------------
+#
+# The chain key is read from a file rather than passed as an argument, which would be
+# visible to every local user in the process table. The agent refuses to start if this
+# file is group- or world-readable.
+#
+# Prefer the file over EnvironmentFile: an environment variable is visible in
+# /proc/PID/environ to anything that can read it.
+ExecStart=/usr/local/bin/openfim-agent \
+    --config /etc/openfim/policy.yaml \
+    --db /var/lib/openfim/openfim.db \
+    --key /etc/openfim/openfim_admin.pub \
+    --hmac-key-file /etc/openfim/chain.key \
+    --log-format json \
+    --append-only-spool
+
+# Structured output goes to the journal, where `journalctl -u openfim-agent -o cat`
+# yields the raw JSON for a collector to tail.
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=openfim
+
+# ---------------------------------------------------------------------------
+# Restart behaviour
+# ---------------------------------------------------------------------------
+#
+# Always restart: a monitor that stays down after a crash is a monitor an attacker only
+# has to crash once. The startup reconciliation sweep covers the gap, so a restart costs
+# a sweep rather than a blind spot.
+Restart=always
+RestartSec=5s
+# Do not give up after repeated restarts. The default StartLimitBurst would disable the
+# unit permanently, which is exactly the outcome an attacker wants.
+StartLimitIntervalSec=0
+
+# ---------------------------------------------------------------------------
+# Hardening
+# ---------------------------------------------------------------------------
+#
+# The agent is privileged and parses untrusted input (file contents, YAML policy,
+# manifests), so it is a worthwhile target in its own right. These directives bound what
+# a successful exploit of the agent could then do.
+
+# Read-only view of the whole filesystem except the paths named below. The agent only
+# ever needs to *read* what it monitors.
+ProtectSystem=strict
+ReadWritePaths=/var/lib/openfim
+# Quarantine and restore write next to the monitored file, so add those roots here if
+# active response is enabled. Left out by default: alert-only needs no write access.
+# ReadWritePaths=/etc /opt/myapp
+
+ProtectHome=read-only
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+ProcSubset=pid
+
+# No new privileges: even if the agent is exploited, it cannot gain more through setuid.
+NoNewPrivileges=true
+
+# Only the capabilities actually required:
+#   DAC_READ_SEARCH  read any file regardless of permissions (the core job)
+#   LINUX_IMMUTABLE  set the append-only flag on the spool (--append-only-spool)
+# Notably absent: CAP_SYS_ADMIN, CAP_NET_*, CAP_SETUID.
+CapabilityBoundingSet=CAP_DAC_READ_SEARCH CAP_LINUX_IMMUTABLE
+AmbientCapabilities=CAP_DAC_READ_SEARCH CAP_LINUX_IMMUTABLE
+
+# The agent makes no network connections. Removing the address families means a
+# post-exploitation reverse shell cannot open a socket from this process.
+RestrictAddressFamilies=AF_UNIX
+PrivateNetwork=false
+IPAddressDeny=any
+
+# Memory and execution hygiene.
+MemoryDenyWriteExecute=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+RestrictNamespaces=true
+
+# Allow only the syscall groups a file-reading daemon needs.
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources @obsolete @cpu-emulation @debug @mount @swap
+SystemCallArchitectures=native
+
+# Resource bounds, so a runaway scan degrades rather than destabilising the host.
+# Doc 13 targets <15MB RSS; this leaves generous headroom while still capping a leak.
+MemoryMax=256M
+TasksMax=64
+# Scanning is deliberately low priority; the policy's scan_nice_priority applies on top.
+Nice=10
+IOSchedulingClass=idle
+CPUSchedulingPolicy=batch
+
+[Install]
+WantedBy=multi-user.target

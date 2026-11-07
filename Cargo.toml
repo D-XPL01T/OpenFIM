@@ -35,3 +35,8 @@ cfg-if = "1.0.0"
 hex = "0.4.3"
 tempfile = "3.17.1"
 glob = "0.3.2"
+# Structured logging for the daemon. The agent is a long-running service whose output
+# must be machine-ingestible; the interactive CLI and console stay on println! because
+# their output is a user interface, not a log stream.
+tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter", "json"] }

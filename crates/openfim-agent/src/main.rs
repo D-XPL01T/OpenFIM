@@ -7,6 +7,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use clap::Parser;
+
+#[macro_use]
+mod logging;
 use openfim_common::notify::{self, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use openfim_common::{
     evaluate, reconcile, support_for, BackupStore, BaselineDb, ChangeKind, ChangeSet, Check,
@@ -74,6 +77,12 @@ struct Args {
     #[arg(long, default_value_t = DEFAULT_MAX_REMEDIATIONS_PER_HOUR)]
     max_remediations_per_hour: u32,
 
+    /// Log output format. `json` emits one object per line for SIEM ingestion.
+    ///
+    /// Verbosity is controlled by `RUST_LOG` in either format.
+    #[arg(long, value_enum, default_value_t = logging::LogFormat::Human)]
+    log_format: logging::LogFormat,
+
     /// Request the Linux append-only inode flag on the spool database.
     ///
     /// Raises the bar on evidence destruction: the kernel then refuses to truncate or
@@ -125,14 +134,24 @@ fn resolve_hmac_key(args: &Args) -> Result<Vec<u8>, Box<dyn std::error::Error>> 
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
-    println!("============================================================");
-    println!("  OpenFIM Defensive Sensor Daemon v0.1.0                    ");
-    println!("  Compliance: PCI DSS 11.5 // NIST 800-53 SI-7              ");
-    println!("============================================================");
+    // Install the log subscriber before anything that could log.
+    logging::init(args.log_format);
+    tracing::info!(
+        version = env!("CARGO_PKG_VERSION"),
+        log_format = %args.log_format,
+        platform = openfim_common::platform_name(),
+        "openfim sensor starting"
+    );
+
+    // The human banner is suppressed under JSON, where it would be an unparseable
+    // interruption in an otherwise machine-readable stream.
+    if args.log_format == logging::LogFormat::Human {
+        print_banner();
+    }
 
     // One-shot inspection mode
     if let Some(ref target_path) = args.inspect {
-        println!(
+        hprintln!(
             "[*] Performing one-shot inspection on: {}",
             target_path.display()
         );
@@ -141,9 +160,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             TokenBucket::new(rate_bytes_per_sec(args.throttle_mb_s.unwrap_or(20))),
         );
         match FileMetadata::extract(target_path, &mut hasher) {
+            // This is the command's result, not a log line, so it always prints.
             Ok(meta) => println!("{}", serde_json::to_string_pretty(&meta)?),
             Err(e) => {
-                eprintln!("[!] Inspection error: {}", e);
+                heprintln!("[!] Inspection error: {}", e);
                 std::process::exit(1);
             }
         }
@@ -152,12 +172,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // 1. Load and optionally verify signed policy
     if !args.config.exists() {
-        eprintln!("[!] Policy file not found: {}", args.config.display());
+        heprintln!("[!] Policy file not found: {}", args.config.display());
         std::process::exit(1);
     }
 
     let policy = if let Some(ref key_path) = args.key {
-        println!(
+        hprintln!(
             "[*] Verifying signed policy with public key: {}",
             key_path.display()
         );
@@ -174,12 +194,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             PolicyVerifier::verify_file_auto(&args.config, &verifying_key)?
         }
     } else {
-        println!("[*] Loading policy from: {}", args.config.display());
+        hprintln!("[*] Loading policy from: {}", args.config.display());
         let content = fs::read_to_string(&args.config)?;
         Policy::from_yaml_str(&content)?
     };
 
-    println!(
+    hprintln!(
         "[*] Policy ID: {} ({} rules loaded)",
         policy.policy_id,
         policy.rules.len()
@@ -205,48 +225,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // switching it would make its entire existing chain fail verification and the tool
     // would report tampering where there was none.
     let (hmac_key, key_scheme) = db.resolve_chain_key(&root_key)?;
-    println!("[*] Chain key:         {}", key_scheme.describe());
+    hprintln!("[*] Chain key:         {}", key_scheme.describe());
     if key_scheme == openfim_common::KeyScheme::Raw {
-        println!(
+        hprintln!(
             "[!] This database predates key derivation. Its chain is still valid, but the \
              supplied secret signs it directly, so a leak compromises every host sharing \
              that secret. Re-baseline into a fresh database to adopt derivation."
         );
     }
-    println!("[*] Local SQLite baseline active: {}", args.db.display());
+    hprintln!("[*] Local SQLite baseline active: {}", args.db.display());
 
     // The baseline is not an ordinary application file: it holds the digests that
     // define "unmodified", so anyone who can write it can redefine correct. Tighten it
     // where possible and say so loudly where not.
     match openfim_common::protect::restrict_to_owner(&args.db) {
-        Ok(true) => println!("[*] Tightened baseline database permissions to owner-only."),
+        Ok(true) => hprintln!("[*] Tightened baseline database permissions to owner-only."),
         Ok(false) => {}
-        Err(e) => eprintln!(
+        Err(e) => heprintln!(
             "[!] Could not restrict baseline database permissions: {}",
             e
         ),
     }
     if let Some(warning) = openfim_common::warn_if_exposed(&args.db, "baseline database") {
-        eprintln!("[!] {}", warning);
+        heprintln!("[!] {}", warning);
     }
 
     if args.append_only_spool {
         let outcome = openfim_common::protect::request_append_only(&args.db);
         if outcome.is_protected() {
-            println!("[*] Spool append-only: {}", outcome.explain());
+            hprintln!("[*] Spool append-only: {}", outcome.explain());
         } else {
             // Never claim a protection that was not applied.
-            eprintln!("[!] Spool append-only NOT in force: {}", outcome.explain());
+            heprintln!("[!] Spool append-only NOT in force: {}", outcome.explain());
         }
     }
 
     if args.remediation {
-        println!(
+        hprintln!(
             "[*] Remediation mode: ENABLED (automated active response, max {}/hour)",
             args.max_remediations_per_hour
         );
     } else {
-        println!("[*] Remediation mode: DISABLED (audit / alert only)");
+        hprintln!("[*] Remediation mode: DISABLED (audit / alert only)");
     }
 
     // Open the pristine-copy store once, up front, so a misconfigured path is reported
@@ -254,14 +274,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let backup_store = match args.backup_dir.as_deref() {
         Some(dir) => match BackupStore::open_or_create(dir) {
             Ok(store) => {
-                println!(
+                hprintln!(
                     "[*] Backup store: {} ({} pristine cop{} indexed)",
                     dir.display(),
                     store.len(),
                     if store.len() == 1 { "y" } else { "ies" }
                 );
                 if store.is_empty() {
-                    println!(
+                    hprintln!(
                         "[!] The backup store is empty, so restore_baseline cannot act. \
                          Populate it with: openfim-cli baseline backup --db {} --out {}",
                         args.db.display(),
@@ -273,9 +293,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Err(e) => {
                 // Do not fall back to "no store": that would silently turn a
                 // restore_baseline policy into alert-only without the operator knowing.
-                eprintln!("[!] Backup store unusable: {}", e);
+                heprintln!("[!] Backup store unusable: {}", e);
                 if args.remediation {
-                    eprintln!(
+                    heprintln!(
                         "[!] Refusing to start with --remediation and an unusable backup store. \
                          Fix the store, or drop --remediation to run in alert-only mode."
                     );
@@ -286,7 +306,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         },
         None => {
             if args.remediation {
-                println!(
+                hprintln!(
                     "[!] No --backup-dir given: restore_baseline rules will decline, \
                      since there is no pristine copy to restore from."
                 );
@@ -298,11 +318,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Resolve the scanner settings the policy asks for. Until now `default_hash`,
     // `max_io_rate_mb_s` and `scan_nice_priority` were parsed and then ignored.
     let settings = policy.effective_scan_settings(args.throttle_mb_s);
-    println!(
+    hprintln!(
         "[*] Hash algorithm:    {:?} (from {})",
-        settings.hash_algorithm.value, settings.hash_algorithm.source
+        settings.hash_algorithm.value,
+        settings.hash_algorithm.source
     );
-    println!(
+    hprintln!(
         "[*] I/O rate limit:    {}",
         if settings.max_io_rate_mb_s.value == 0 {
             format!("unlimited (from {})", settings.max_io_rate_mb_s.source)
@@ -315,16 +336,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     match openfim_common::policy::apply_scan_priority(settings.scan_nice_priority.value) {
-        Ok(()) => println!(
+        Ok(()) => hprintln!(
             "[*] Scan priority:     {} (from {})",
-            settings.scan_nice_priority.value, settings.scan_nice_priority.source
+            settings.scan_nice_priority.value,
+            settings.scan_nice_priority.source
         ),
         // Report rather than swallow: lowering priority needs privilege on Unix, and an
         // operator who configured it deserves to know it did not take effect.
-        Err(e) => println!(
+        Err(e) => hprintln!(
             "[!] Scan priority {} could not be applied: {}. Scanning continues at the \
              default priority.",
-            settings.scan_nice_priority.value, e
+            settings.scan_nice_priority.value,
+            e
         ),
     }
 
@@ -335,7 +358,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     report_unenforceable_checks(&policy);
 
     if !ProcessContext::attribution_available() {
-        println!(
+        hprintln!(
             "[!] Process attribution: UNAVAILABLE on this build. Alerts will record the \
              integrity violation but not the writing process. Kernel-level attribution \
              (fanotify FAN_REPORT_PIDFD, eBPF, or a Windows minifilter) is required to \
@@ -388,19 +411,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
-    println!(
+    hprintln!(
         "[*] Real-time sensor active: watching {} filesystem target(s)",
         registered_count
     );
     if sweep_only_rules > 0 {
-        println!(
+        hprintln!(
             "[*] {} rule(s) are scheduled or on-boot, so they are covered by the \
              reconciliation sweep rather than by a live watch.",
             sweep_only_rules
         );
     }
     if registered_count == 0 && sweep_only_rules == 0 {
-        eprintln!(
+        heprintln!(
             "[!] Warning: 0 watch targets could be registered. Verify monitored paths exist on disk."
         );
     }
@@ -431,7 +454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let _ = label;
     }
     if self_watched > 0 {
-        println!(
+        hprintln!(
             "[*] Self-defense: watching {} additional location(s) holding the agent's own \
              binary, policy, key and baseline.",
             self_watched
@@ -442,14 +465,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let shutdown_signal = shutdown.clone();
     tokio::spawn(async move {
         if tokio::signal::ctrl_c().await.is_ok() {
-            println!(
+            hprintln!(
                 "\n[*] Received shutdown signal (Ctrl+C). Terminating OpenFIM agent gracefully."
             );
             shutdown_signal.store(true, Ordering::SeqCst);
         }
     });
 
-    println!("[*] Sensor loop running. Press Ctrl+C to stop.");
+    hprintln!("[*] Sensor loop running. Press Ctrl+C to stop.");
 
     // 4. Run the sensor loop on the blocking pool.
     //
@@ -466,12 +489,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let sweep_interval = Duration::from_secs(settings.sweep_interval_secs.value);
     if sweep_interval.is_zero() {
-        println!(
+        hprintln!(
             "[!] Reconciliation sweep DISABLED (globals.realtime_fallback_sweep_interval \
              is 0). Events dropped by the watcher will not be recovered."
         );
     } else {
-        println!(
+        hprintln!(
             "[*] Reconciliation sweep: every {}s (from {})",
             sweep_interval.as_secs(),
             settings.sweep_interval_secs.source
@@ -481,7 +504,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Read through the compiled policy: the owned `Policy` was moved into it above.
     let max_spool_mb = compiled.policy().globals.max_spool_mb;
     let max_spool_bytes = max_spool_mb.saturating_mul(1024).saturating_mul(1024);
-    println!(
+    hprintln!(
         "[*] Spool quota:       {}",
         if max_spool_bytes == 0 {
             "unlimited".to_string()
@@ -569,7 +592,14 @@ fn sensor_loop(
                 // gone, so record the gap and reconcile immediately rather than
                 // carrying on as though coverage were continuous.
                 if event.need_rescan() {
-                    eprintln!(
+                    // Logged at ERROR: an unobserved window is a coverage failure, not
+                    // routine noise, and a collector should be able to alert on it.
+                    tracing::error!(
+                        event_type = EVENT_WATCH_OVERFLOW,
+                        "watcher overflow: the kernel dropped filesystem events, leaving \
+                         an unobserved window; forcing immediate reconciliation"
+                    );
+                    heprintln!(
                         "\n[!] WATCHER OVERFLOW: the kernel dropped filesystem events. \
                          An unobserved window exists; forcing immediate reconciliation."
                     );
@@ -720,14 +750,15 @@ fn run_sweep(
         return;
     }
 
-    println!("[*] Reconciliation sweep starting ({})", reason);
+    tracing::info!(reason = %reason, roots = roots.len(), "reconciliation sweep starting");
+    hprintln!("[*] Reconciliation sweep starting ({})", reason);
     let started = Instant::now();
 
     let mut hasher = StreamHasher::new(cfg.hash_algorithm, TokenBucket::new(cfg.rate_bytes));
     let outcome = match reconcile(db, policy, &roots, &mut hasher) {
         Ok(o) => o,
         Err(e) => {
-            eprintln!("[!] Reconciliation sweep failed: {}", e);
+            heprintln!("[!] Reconciliation sweep failed: {}", e);
             return;
         }
     };
@@ -742,7 +773,7 @@ fn run_sweep(
             continue;
         }
 
-        println!(
+        hprintln!(
             "\n[!] SWEEP DIVERGENCE on {} ({} change(s) the watcher did not report)",
             finding.path.display(),
             finding.changes.len()
@@ -776,7 +807,7 @@ fn run_sweep(
             suppressed += 1;
             continue;
         }
-        println!(
+        hprintln!(
             "\n[!] SWEEP DIVERGENCE: {} is in the baseline but missing from disk",
             missing.baseline.path.display()
         );
@@ -798,7 +829,7 @@ fn run_sweep(
             suppressed += 1;
             continue;
         }
-        println!(
+        hprintln!(
             "\n[!] SWEEP DIVERGENCE: unbaselined file present at {}",
             added.path.display()
         );
@@ -816,7 +847,7 @@ fn run_sweep(
     }
 
     for (path, err) in &outcome.errors {
-        eprintln!("[!] Sweep could not read {}: {}", path.display(), err);
+        heprintln!("[!] Sweep could not read {}: {}", path.display(), err);
     }
 
     // Suppression is reported, never hidden. The operator must be able to tell
@@ -831,7 +862,18 @@ fn run_sweep(
         String::new()
     };
 
-    println!(
+    tracing::info!(
+        reason = %reason,
+        duration_secs = started.elapsed().as_secs_f64(),
+        scanned = outcome.scanned,
+        modified = outcome.findings.len(),
+        missing = outcome.missing.len(),
+        unbaselined = outcome.unbaselined.len(),
+        unreadable = outcome.errors.len(),
+        suppressed = suppressed,
+        "reconciliation sweep complete"
+    );
+    hprintln!(
         "[*] Reconciliation sweep complete in {:.1}s: {}{}",
         started.elapsed().as_secs_f64(),
         outcome.summary(),
@@ -863,7 +905,7 @@ fn enforce_spool_quota(db: &BaselineDb, cfg: &SensorConfig) {
     match db.prune_spool_to_quota(cfg.max_spool_bytes) {
         Ok(0) => {}
         Ok(removed) => {
-            println!(
+            hprintln!(
                 "[*] Spool exceeded its {} MB quota; pruned {} already-forwarded event(s).",
                 cfg.max_spool_bytes / (1024 * 1024),
                 removed
@@ -885,7 +927,7 @@ fn enforce_spool_quota(db: &BaselineDb, cfg: &SensorConfig) {
                 &cfg.hmac_key,
             );
         }
-        Err(e) => eprintln!("[!] Could not enforce the spool quota: {}", e),
+        Err(e) => heprintln!("[!] Could not enforce the spool quota: {}", e),
     }
 }
 
@@ -950,7 +992,7 @@ fn handle_path_event(
             Err(e) => {
                 // Surface the failure instead of dropping it. A file that cannot be
                 // read is exactly the state an attacker wants the monitor to ignore.
-                eprintln!(
+                heprintln!(
                     "[!] Could not inspect {} after a change event: {}",
                     path.display(),
                     e
@@ -982,8 +1024,8 @@ fn handle_path_event(
                     };
                     if let Some(ref outcome) = content_diff {
                         match outcome.diff() {
-                            Some(text) => println!("    Diff:\n{}", indent_block(text)),
-                            None => println!("    Diff:       {}", outcome.explain()),
+                            Some(text) => hprintln!("    Diff:\n{}", indent_block(text)),
+                            None => hprintln!("    Diff:       {}", outcome.explain()),
                         }
                     }
 
@@ -1039,7 +1081,7 @@ fn handle_path_event(
                 record_event(db, &mut spool, &cfg.hmac_key);
             }
             Err(e) => {
-                eprintln!("[!] Baseline lookup failed for {}: {}", path.display(), e);
+                heprintln!("[!] Baseline lookup failed for {}: {}", path.display(), e);
             }
         }
     } else if !exists {
@@ -1069,7 +1111,7 @@ fn handle_path_event(
             }
             Ok(None) => {}
             Err(e) => {
-                eprintln!("[!] Baseline lookup failed for {}: {}", path.display(), e);
+                heprintln!("[!] Baseline lookup failed for {}: {}", path.display(), e);
             }
         }
     }
@@ -1078,12 +1120,33 @@ fn handle_path_event(
 /// Appends an event to the tamper-evident chain, reporting a failure rather than
 /// silently discarding the record.
 fn record_event(db: &BaselineDb, spool: &mut SpoolEvent, hmac_key: &[u8]) {
-    if let Err(e) = db.append_spool_event_chained(spool, hmac_key) {
-        eprintln!(
-            "[!] CRITICAL: failed to record event {} to the tamper-evident log: {}. \
-             The alert above is NOT in the audit chain.",
-            spool.event_id, e
-        );
+    match db.append_spool_event_chained(spool, hmac_key) {
+        Ok(seq) => tracing::info!(
+            sequence_id = seq,
+            event_id = %spool.event_id,
+            event_type = %spool.event_type,
+            path = %spool.path,
+            severity = spool.severity,
+            "event recorded to the tamper-evident chain"
+        ),
+        Err(e) => {
+            // A failure here means the alert exists only in this log line. Record that
+            // explicitly: an alert missing from the chain is itself a finding.
+            tracing::error!(
+                event_id = %spool.event_id,
+                event_type = %spool.event_type,
+                path = %spool.path,
+                error = %e,
+                "FAILED to record event to the tamper-evident chain; this alert is NOT \
+                 in the audit chain"
+            );
+            heprintln!(
+                "[!] CRITICAL: failed to record event {} to the tamper-evident log: {}. \
+                 The alert above is NOT in the audit chain.",
+                spool.event_id,
+                e
+            );
+        }
     }
 }
 
@@ -1105,7 +1168,7 @@ fn apply_remediation(
     }
     match guard.execute(rule.active_response.action, path, cfg.backup.as_ref()) {
         Ok(outcome) => {
-            println!("    [REMEDIATION] {}", outcome);
+            hprintln!("    [REMEDIATION] {}", outcome);
             if outcome.was_applied() {
                 reanchor_after_restore(path, cfg, db);
                 true
@@ -1114,7 +1177,7 @@ fn apply_remediation(
             }
         }
         Err(e) => {
-            eprintln!("    [REMEDIATION] failed: {}", e);
+            heprintln!("    [REMEDIATION] failed: {}", e);
             false
         }
     }
@@ -1135,7 +1198,7 @@ fn reanchor_after_restore(path: &Path, cfg: &SensorConfig, db: &BaselineDb) {
     let restored = match FileMetadata::extract(path, &mut hasher) {
         Ok(m) => m,
         Err(e) => {
-            eprintln!(
+            heprintln!(
                 "    [!] Restored {} but could not re-read it to re-anchor the baseline: {}",
                 path.display(),
                 e
@@ -1146,18 +1209,32 @@ fn reanchor_after_restore(path: &Path, cfg: &SensorConfig, db: &BaselineDb) {
 
     match db.reanchor_entry_identity(path, &restored) {
         Ok(true) => {}
-        Ok(false) => eprintln!(
+        Ok(false) => heprintln!(
             "    [!] Restored {} but its content does not match the baseline digest, so \
              the baseline identity was left unchanged. Investigate: the backup store may \
              hold content that was never the approved baseline.",
             path.display()
         ),
-        Err(e) => eprintln!(
+        Err(e) => heprintln!(
             "    [!] Could not re-anchor the baseline identity for {}: {}",
             path.display(),
             e
         ),
     }
+}
+
+/// The human-readable startup banner.
+///
+/// Suppressed under `--log-format json`, where decorative output would be an
+/// unparseable interruption in a stream a collector is reading line by line.
+fn print_banner() {
+    hprintln!("============================================================");
+    hprintln!(
+        "  OpenFIM Defensive Sensor Daemon v{}                     ",
+        env!("CARGO_PKG_VERSION")
+    );
+    hprintln!("  Compliance: PCI DSS 11.5 // NIST 800-53 SI-7              ");
+    hprintln!("============================================================");
 }
 
 /// Maps a change's rank onto an operator-facing severity label.
@@ -1179,47 +1256,67 @@ fn print_alert(
     old_hash: Option<&str>,
     new_hash: Option<&str>,
 ) {
-    println!("\n[!] ==================== OPENFIM INTEGRITY ALERT ====================");
-    println!("    Level:      {} (Severity: {}/10)", level, severity);
-    println!("    Event:      {}", event_type);
-    println!("    Path:       {}", path.display());
+    hprintln!("\n[!] ==================== OPENFIM INTEGRITY ALERT ====================");
+    hprintln!("    Level:      {} (Severity: {}/10)", level, severity);
+    hprintln!("    Event:      {}", event_type);
+    hprintln!("    Path:       {}", path.display());
     if let Some(oh) = old_hash {
-        println!("    Old SHA256: {}", oh);
+        hprintln!("    Old SHA256: {}", oh);
     }
     if let Some(nh) = new_hash {
-        println!("    New SHA256: {}", nh);
+        hprintln!("    New SHA256: {}", nh);
     }
     print_whodata(who);
-    println!("    Timestamp:  {}", unix_now_secs());
-    println!("======================================================================");
+    hprintln!("    Timestamp:  {}", unix_now_secs());
+    hprintln!("======================================================================");
 }
 
 /// Alert covering every difference the detection engine found for one path.
+///
+/// Emitted twice over: once as a structured log event whose fields a SIEM can filter on
+/// without parsing prose, and once as the readable block an operator watching a terminal
+/// expects. The structured form is the one that matters for ingestion, which is why the
+/// fields are named rather than interpolated into the message.
 fn print_change_alert(path: &Path, severity: u32, who: &ProcessContext, changes: &ChangeSet) {
     let headline = match changes.most_severe() {
         Some(c) => c,
         None => return,
     };
 
-    println!("\n[!] ==================== OPENFIM INTEGRITY ALERT ====================");
-    println!(
+    tracing::warn!(
+        event_type = headline.event_type(),
+        // Named `alert_level`, not `level`: the subscriber emits its own `level` field,
+        // and two keys of the same name in one JSON object are ambiguous — a collector
+        // would silently keep whichever it parsed last.
+        alert_level = level_for(headline),
+        severity = severity,
+        path = %path.display(),
+        change_count = changes.len(),
+        changes = %changes.event_types().join(","),
+        attributed = who.is_attributed,
+        skipped_checks = changes.skipped_unsupported.len(),
+        "integrity violation detected"
+    );
+
+    hprintln!("\n[!] ==================== OPENFIM INTEGRITY ALERT ====================");
+    hprintln!(
         "    Level:      {} (Severity: {}/10)",
         level_for(headline),
         severity
     );
-    println!("    Event:      {}", headline.event_type());
-    println!("    Path:       {}", path.display());
+    hprintln!("    Event:      {}", headline.event_type());
+    hprintln!("    Path:       {}", path.display());
 
-    println!("    Changes:    {} detected", changes.len());
+    hprintln!("    Changes:    {} detected", changes.len());
     let mut ordered: Vec<&ChangeKind> = changes.changes.iter().collect();
     ordered.sort_by_key(|c| std::cmp::Reverse(c.rank()));
     for change in ordered {
-        println!("      - [{}] {}", change.event_type(), change.describe());
+        hprintln!("      - [{}] {}", change.event_type(), change.describe());
     }
 
     print_whodata(who);
-    println!("    Timestamp:  {}", unix_now_secs());
-    println!("======================================================================");
+    hprintln!("    Timestamp:  {}", unix_now_secs());
+    hprintln!("======================================================================");
 }
 
 /// State plainly whether the acting process is known.
@@ -1228,13 +1325,16 @@ fn print_change_alert(path: &Path, severity: u32, who: &ProcessContext, changes:
 /// into the operator's hands and into the audit trail.
 fn print_whodata(who: &ProcessContext) {
     if who.is_attributed {
-        println!(
+        hprintln!(
             "    Who-Data:   PID={} Comm={:?} Exe={:?} Cmdline={:?}",
-            who.pid, who.comm, who.exe, who.cmdline
+            who.pid,
+            who.comm,
+            who.exe,
+            who.cmdline
         );
     } else {
-        println!("    Who-Data:   UNATTRIBUTED - the writing process could not be identified");
-        println!("                (kernel-level attribution is required and unavailable here)");
+        hprintln!("    Who-Data:   UNATTRIBUTED - the writing process could not be identified");
+        hprintln!("                (kernel-level attribution is required and unavailable here)");
     }
 }
 
@@ -1276,15 +1376,15 @@ fn report_unenforceable_checks(policy: &Policy) {
         return;
     }
 
-    println!(
+    hprintln!(
         "[!] {} of the checks this policy enables cannot be enforced on {}:",
         offenders.len(),
         openfim_common::platform_name()
     );
     for (field, reason) in &offenders {
-        println!("      - {}: {}", field, reason);
+        hprintln!("      - {}: {}", field, reason);
     }
-    println!(
+    hprintln!(
         "    These are reported as skipped rather than silently passing. \
          Run `openfim-cli policy lint` for the full picture."
     );
@@ -1436,6 +1536,7 @@ mod tests {
             max_remediations_per_hour: 3,
             heartbeat_secs: 300,
             append_only_spool: false,
+            log_format: logging::LogFormat::Human,
             backup_dir: None,
         }
     }
